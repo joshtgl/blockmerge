@@ -2,6 +2,11 @@
 name = "blockmerge"
 version = "0.1.0"
 edition = "2024"
+license = "MIT OR Apache-2.0"
+description = "Retrieve, merge, and generate inbound and outbound IP blocklists"
+authors = [
+  "Josh <git@bnhtech.com",
+]
 
 [dependencies]
 chrono = { version = "0.4", features = ["serde"] }
