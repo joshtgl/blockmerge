@@ -80,7 +80,7 @@ pub fn load_manifest(path: &Path) -> Result<DownloadManifest, Box<dyn std::error
 
 /// Return the lowercase hexadecimal SHA-256 checksum for a source body.
 pub fn sha256_hex(body: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(body))
+    hex::encode(Sha256::digest(body))
 }
 
 fn validate_entry(entry: &DownloadManifestEntry) -> Result<(), Box<dyn std::error::Error>> {
