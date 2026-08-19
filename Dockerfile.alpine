@@ -1,0 +1,61 @@
+# syntax=docker/dockerfile:1
+
+FROM rust:1-bookworm AS builder
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends musl-tools \
+    && rm -rf /var/lib/apt/lists/* \
+    && rustup target add x86_64-unknown-linux-musl
+
+WORKDIR /build
+
+COPY Cargo.toml Cargo.lock ./
+COPY src ./src
+
+ENV CC_x86_64_unknown_linux_musl=musl-gcc
+
+RUN cargo build --locked --release --target x86_64-unknown-linux-musl \
+    --bin blockmerge --bin blockmerge-web
+
+FROM alpine:3.24.1 AS runtime-base
+
+ARG BLOCKMERGE_GID=10001
+ARG BLOCKMERGE_UID=10001
+
+RUN apk add --no-cache ca-certificates \
+    && addgroup -S -g "${BLOCKMERGE_GID}" blockmerge \
+    && adduser -S -D -H -u "${BLOCKMERGE_UID}" -G blockmerge blockmerge \
+    && mkdir -p /app/config /app/data/cache /app/output /app/public \
+    && chown -R blockmerge:blockmerge /app
+
+WORKDIR /app
+
+FROM runtime-base AS cli
+
+COPY --from=builder /build/target/x86_64-unknown-linux-musl/release/blockmerge /usr/local/bin/blockmerge
+
+ENV BLOCKMERGE_CONFIG_FILE=/app/config/blockmerge.toml \
+    BLOCKMERGE_STATE_FILE=/app/data/state.json \
+    BLOCKMERGE_CACHE_DIR=/app/data/cache \
+    BLOCKMERGE_INBOUND_OUTPUT=/app/output/inbound.txt \
+    BLOCKMERGE_OUTBOUND_OUTPUT=/app/output/outbound.txt
+
+USER blockmerge
+
+ENTRYPOINT ["blockmerge"]
+CMD ["--daemon"]
+
+FROM runtime-base AS web
+
+COPY --from=builder /build/target/x86_64-unknown-linux-musl/release/blockmerge-web /usr/local/bin/blockmerge-web
+
+ENV BLOCKMERGE_CONFIG_FILE=/app/config/blockmerge.toml \
+    BLOCKMERGE_STATE_FILE=/app/data/state.json \
+    BLOCKMERGE_CACHE_DIR=/app/data/cache \
+    SERVER_PORT=8080
+
+EXPOSE 8080
+
+USER blockmerge
+
+ENTRYPOINT ["blockmerge-web"]

@@ -1,0 +1,28 @@
+[package]
+name = "blockmerge"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4.6.1", features = ["derive", "env"] }
+csv = "1.3"
+etcetera = "0.11"
+globset = "0.4.18"
+http = "0.2"
+ipnet = "2.12.0"
+iprange = "0.6.7"
+regex-lite = "0.1.8"
+reqwest = { version = "0.13.2", features = ["blocking", "json"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+static-web-server = { version = "2.42.0", default-features = false, features = ["directory-listing"] }
+sha2 = "0.10"
+tempfile = "3.20.0"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-cron-scheduler = "0.15.1"
+toml = "1.1.2"
+zip = { version = "2.4", default-features = false, features = ["deflate"] }
+
+[dev-dependencies]
+mockito = "1.7.2"

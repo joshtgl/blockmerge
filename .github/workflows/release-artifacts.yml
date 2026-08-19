@@ -1,0 +1,185 @@
+name: Release artifacts
+
+on:
+  workflow_call:
+    inputs:
+      repository:
+        description: Repository to check out and use for GHCR image names
+        required: true
+        type: string
+      ref:
+        description: Commit, branch, or tag to check out
+        required: true
+        type: string
+      version:
+        description: Release version used in artifact and image names
+        required: true
+        type: string
+      publish_artifacts:
+        description: Whether to publish images and create attestations
+        required: true
+        type: boolean
+
+permissions:
+  contents: read
+
+jobs:
+  build-static-binaries:
+    name: Build static release binaries
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      attestations: write
+      artifact-metadata: write
+      id-token: write
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          repository: ${{ inputs.repository }}
+          ref: ${{ inputs.ref }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@67ef31d5b988238dd797d409d6f9574278e20537 # stable
+        with:
+          toolchain: stable
+          targets: x86_64-unknown-linux-musl
+
+      - name: Cache Cargo artifacts
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+
+      - name: Install Zig
+        uses: mlugg/setup-zig@d1434d08867e3ee9daa34448df10607b98908d29 # v2.2.1
+        with:
+          version: 0.16.0
+
+      - name: Install release tooling
+        run: |
+          cargo install cargo-zigbuild --version 0.23.0 --locked
+          cargo install cargo-cyclonedx --version 0.5.9 --locked
+
+      - name: Build static binaries
+        run: cargo zigbuild --release --locked --bins --target x86_64-unknown-linux-musl
+
+      - name: Stage static binary archive
+        id: static_asset
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euxo pipefail
+          mkdir -p dist/static
+          archive="dist/static/blockmerge-${VERSION}-x86_64-unknown-linux-musl.tar.gz"
+          tar -C target/x86_64-unknown-linux-musl/release -czf "$archive" \
+            blockmerge \
+            blockmerge-download-raw \
+            blockmerge-offline-generate \
+            blockmerge-web
+          echo "archive=$archive" >> "$GITHUB_OUTPUT"
+
+      - name: Generate binary SBOM
+        id: static_sbom
+        run: |
+          set -euxo pipefail
+          cargo cyclonedx --format json --target x86_64-unknown-linux-musl \
+            --override-filename blockmerge-x86_64-unknown-linux-musl.cdx
+          sbom="blockmerge-x86_64-unknown-linux-musl.cdx.json"
+          test -f "$sbom"
+          mv "$sbom" dist/static/
+          echo "path=dist/static/$sbom" >> "$GITHUB_OUTPUT"
+
+      - name: Attest binary provenance
+        if: inputs.publish_artifacts
+        uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763 # v4.1.1
+        with:
+          subject-path: ${{ steps.static_asset.outputs.archive }}
+
+      - name: Attest binary SBOM
+        if: inputs.publish_artifacts
+        uses: actions/attest@a1948c3f048ba23858d222213b7c278aabede763 # v4.1.1
+        with:
+          subject-path: ${{ steps.static_asset.outputs.archive }}
+          sbom-path: ${{ steps.static_sbom.outputs.path }}
+
+      - name: Upload static binary artifact
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: static-binaries-x86_64-unknown-linux-musl
+          path: dist/static/
+          if-no-files-found: error
+
+  build-containers:
+    name: Build container (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+      attestations: write
+      id-token: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: cli-debian
+            dockerfile: Dockerfile.debian
+            stage: cli
+            image_suffix: ""
+            variant: debian
+          - target: web-debian
+            dockerfile: Dockerfile.debian
+            stage: web
+            image_suffix: -web
+            variant: debian
+          - target: cli-alpine
+            dockerfile: Dockerfile.alpine
+            stage: cli
+            image_suffix: ""
+            variant: alpine
+          - target: web-alpine
+            dockerfile: Dockerfile.alpine
+            stage: web
+            image_suffix: -web
+            variant: alpine
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          repository: ${{ inputs.repository }}
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
+
+      - name: Log in to GitHub Container Registry
+        if: inputs.publish_artifacts
+        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Generate image metadata
+        id: metadata
+        uses: docker/metadata-action@030e881283bb7a6894de51c315a6bfe6a94e05cf # v6.0.0
+        with:
+          images: ghcr.io/${{ inputs.repository }}${{ matrix.image_suffix }}
+          tags: |
+            type=raw,value=${{ inputs.version }}-${{ matrix.variant }}
+            type=raw,value=${{ matrix.variant }}
+
+      - name: Build and optionally publish container
+        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
+        with:
+          context: .
+          file: ${{ matrix.dockerfile }}
+          target: ${{ matrix.stage }}
+          platforms: linux/amd64
+          push: ${{ inputs.publish_artifacts }}
+          tags: ${{ steps.metadata.outputs.tags }}
+          labels: ${{ steps.metadata.outputs.labels }}
+          cache-from: type=gha,scope=${{ matrix.target }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.target }}
+          provenance: ${{ inputs.publish_artifacts && 'mode=max' || 'false' }}
+          sbom: ${{ inputs.publish_artifacts }}

@@ -1,0 +1,56 @@
+# syntax=docker/dockerfile:1
+
+FROM rust:1-bookworm AS builder
+
+WORKDIR /build
+
+COPY Cargo.toml Cargo.lock ./
+COPY src ./src
+
+RUN cargo build --locked --release --bin blockmerge --bin blockmerge-web
+
+FROM debian:13.6-slim AS runtime-base
+
+ARG BLOCKMERGE_GID=10001
+ARG BLOCKMERGE_UID=10001
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && groupadd --system --gid "${BLOCKMERGE_GID}" blockmerge \
+    && useradd --system --uid "${BLOCKMERGE_UID}" --gid blockmerge \
+        --home-dir /app --no-create-home blockmerge \
+    && mkdir -p /app/config /app/data/cache /app/output /app/public \
+    && chown -R blockmerge:blockmerge /app
+
+WORKDIR /app
+
+FROM runtime-base AS cli
+
+COPY --from=builder /build/target/release/blockmerge /usr/local/bin/blockmerge
+
+ENV BLOCKMERGE_CONFIG_FILE=/app/config/blockmerge.toml \
+    BLOCKMERGE_STATE_FILE=/app/data/state.json \
+    BLOCKMERGE_CACHE_DIR=/app/data/cache \
+    BLOCKMERGE_INBOUND_OUTPUT=/app/output/inbound.txt \
+    BLOCKMERGE_OUTBOUND_OUTPUT=/app/output/outbound.txt
+
+USER blockmerge
+
+ENTRYPOINT ["blockmerge"]
+CMD ["--daemon"]
+
+FROM runtime-base AS web
+
+COPY --from=builder /build/target/release/blockmerge-web /usr/local/bin/blockmerge-web
+
+ENV BLOCKMERGE_CONFIG_FILE=/app/config/blockmerge.toml \
+    BLOCKMERGE_STATE_FILE=/app/data/state.json \
+    BLOCKMERGE_CACHE_DIR=/app/data/cache \
+    SERVER_PORT=8080
+
+EXPOSE 8080
+
+USER blockmerge
+
+ENTRYPOINT ["blockmerge-web"]
