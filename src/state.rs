@@ -15,6 +15,19 @@ pub const STATE_VERSION: u32 = 1;
 pub struct CachedSource {
     pub cache_file: String,
     pub sha256: String,
+    #[serde(default)]
+    pub http_validators: Option<HttpValidators>,
+}
+
+/// HTTP validators associated with a cached representation.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct HttpValidators {
+    /// Hash of the effective request URL, including any query parameters.
+    pub resource_key: String,
+    #[serde(default)]
+    pub etag: Option<String>,
+    #[serde(default)]
+    pub last_modified: Option<String>,
 }
 
 /// Information about the last successful update for a list source.
@@ -198,11 +211,58 @@ mod tests {
             CachedSource {
                 cache_file: "successful.body".to_string(),
                 sha256: "0".repeat(64),
+                http_validators: None,
             },
         );
 
         assert_eq!(state.sources["failed"].consecutive_failures, 1);
         assert_eq!(state.sources["successful"].consecutive_failures, 0);
+    }
+
+    #[test]
+    fn loads_version_one_state_without_http_validators() {
+        let state: StateFile = serde_json::from_str(
+            r#"{
+                "version": 1,
+                "sources": {
+                    "alpha": {
+                        "last_success_at": "2026-01-01T00:00:00Z",
+                        "cached_source": {
+                            "cache_file": "alpha.body",
+                            "sha256": "abc"
+                        }
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            state.sources["alpha"]
+                .cached_source
+                .as_ref()
+                .unwrap()
+                .http_validators,
+            None
+        );
+    }
+
+    #[test]
+    fn round_trips_http_validators() {
+        let cached = CachedSource {
+            cache_file: "alpha.body".to_string(),
+            sha256: "abc".to_string(),
+            http_validators: Some(HttpValidators {
+                resource_key: "resource".to_string(),
+                etag: Some("\"v1\"".to_string()),
+                last_modified: Some("Wed, 21 Oct 2015 07:28:00 GMT".to_string()),
+            }),
+        };
+
+        let decoded: CachedSource =
+            serde_json::from_str(&serde_json::to_string(&cached).unwrap()).unwrap();
+
+        assert_eq!(decoded, cached);
     }
 
     #[test]

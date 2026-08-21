@@ -97,6 +97,8 @@ Legacy array-shaped manifests are unsupported. Regenerate them with `blockmerge-
 
 Network sources use a last-known-good raw-body cache by default. After a fetch failure, Blockmerge uses a verified cached body only while it is younger than `max_stale_age` and has fewer than `max_consecutive_failures` consecutive failures. The defaults are 24 hours and four failures; override them in `[resilience]` or set `enabled = false` to disable fallback.
 
+Cached HTTP sources automatically use `ETag` and `Last-Modified` validators when provided by the server. An unchanged response reuses the checksum-verified cached body instead of downloading it again. Conditional requests require resilience and are disabled when `enabled = false`; normal-source fallback is disabled as before, while GeoIP retains its independent scheduled snapshot behavior. No per-source opt-in is required.
+
 State and cached bodies use native per-user application directories through `etcetera`. Override them for containers or services with `--state-file` / `BLOCKMERGE_STATE_FILE` and `--cache-dir` / `BLOCKMERGE_CACHE_DIR`; command-line values take precedence over environment variables. In the container, mount the selected paths when refresh state must survive replacement.
 
 ## GeoIP country blocks

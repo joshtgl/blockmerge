@@ -227,14 +227,20 @@ impl GeoIpConfig {
         Ok(self.download_spec()?.url)
     }
 
-    /// Download the configured database without logging its credential-bearing URL.
-    pub fn fetch_database(&self, client: &Client) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    /// Return the effective database URL used for an HTTP request.
+    pub(crate) fn database_request_url(&self) -> Result<Url, Box<dyn std::error::Error>> {
         let spec = self.download_spec()?;
         let mut url = spec.url;
         if let Some(parameter) = spec.api_key_query_parameter {
             let api_key = self.api_key().ok_or("missing GeoIP API key")?;
             url.query_pairs_mut().append_pair(&parameter, &api_key);
         }
+        Ok(url)
+    }
+
+    /// Download the configured database without logging its credential-bearing URL.
+    pub fn fetch_database(&self, client: &Client) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+        let url = self.database_request_url()?;
         println!(
             "  Fetching {:?} country database for '{}'...",
             self.service, self.name

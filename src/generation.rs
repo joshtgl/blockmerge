@@ -1,11 +1,17 @@
 //! Retrieve configured sources and generate directional blocklists.
 
 use std::fs;
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
 
 use chrono::{DateTime, Utc};
-use reqwest::blocking::Client;
+use reqwest::StatusCode;
+use reqwest::Url;
+use reqwest::blocking::{Client, Response};
+use reqwest::header::{
+    ETAG, HeaderMap, HeaderName, HeaderValue, IF_MODIFIED_SINCE, IF_NONE_MATCH, LAST_MODIFIED,
+};
+use sha2::{Digest, Sha256};
 use tempfile::NamedTempFile;
 
 use crate::config::{Config, ResiliencePolicy};
@@ -13,7 +19,7 @@ use crate::geoip::{GeoIpConfig, GeoIpEntries};
 use crate::offline::sha256_hex;
 use crate::ranges::{DirectionalBlocklists, IpRangeAccumulator};
 use crate::source::{Direction, ListType};
-use crate::state::{CachedSource, StateFile};
+use crate::state::{CachedSource, HttpValidators, StateFile};
 
 /// Rendered blocklist contents, entry counts, and successfully retrieved sources.
 pub struct GeneratedBlocklistOutputs {
@@ -37,10 +43,43 @@ pub struct RetrievedBlocklists {
 pub enum SourceRefreshOutcome {
     Inline { name: String },
     Fresh { name: String },
+    NotModified { name: String },
     Stale { name: String, failures: u32 },
     Unavailable { name: String },
     Expired { name: String, failures: u32 },
     Cached { name: String },
+}
+
+enum CachedHttpResponse {
+    Modified {
+        response: Response,
+        validators: Option<HttpValidators>,
+    },
+    NotModified {
+        body: Vec<u8>,
+        cached_source: CachedSource,
+    },
+}
+
+enum CachedTextResponse {
+    Modified {
+        body: String,
+        validators: Option<HttpValidators>,
+    },
+    NotModified {
+        body: String,
+        cached_source: CachedSource,
+    },
+}
+
+enum HttpResponse {
+    Modified {
+        response: Response,
+        validators: Option<HttpValidators>,
+    },
+    NotModified {
+        validators: Option<HttpValidators>,
+    },
 }
 
 /// Mutable state and cache used while retrieving resilient sources.
@@ -110,6 +149,234 @@ fn parse_source_body(
     source.visit_entries(body, |entry| {
         ranges.add(source.list_type, source.direction, entry)
     })
+}
+
+fn response_header(headers: &HeaderMap, name: HeaderName, source_name: &str) -> Option<String> {
+    let value = headers.get(&name)?;
+    match value.to_str() {
+        Ok(value) => Some(value.to_string()),
+        Err(_) => {
+            eprintln!(
+                "  Ignoring non-text {} response header for '{}'",
+                name.as_str(),
+                source_name
+            );
+            None
+        }
+    }
+}
+
+fn response_validators(
+    headers: &HeaderMap,
+    resource_key: &str,
+    source_name: &str,
+) -> Option<HttpValidators> {
+    let etag = response_header(headers, ETAG, source_name);
+    let last_modified = response_header(headers, LAST_MODIFIED, source_name);
+    if etag.is_none() && last_modified.is_none() {
+        None
+    } else {
+        Some(HttpValidators {
+            resource_key: resource_key.to_string(),
+            etag,
+            last_modified,
+        })
+    }
+}
+
+fn send_http_request(
+    client: &Client,
+    source_name: &str,
+    url: Url,
+    stored_validators: Option<&HttpValidators>,
+) -> Result<HttpResponse, Box<dyn std::error::Error>> {
+    let resource_key = sha256_hex(url.as_str().as_bytes());
+    let mut request = client.get(url);
+    let mut sent_conditional = false;
+
+    if let Some(validators) = stored_validators.filter(|value| value.resource_key == resource_key) {
+        for (name, value) in [
+            (IF_NONE_MATCH, validators.etag.as_deref()),
+            (IF_MODIFIED_SINCE, validators.last_modified.as_deref()),
+        ] {
+            let Some(value) = value else {
+                continue;
+            };
+            match HeaderValue::try_from(value) {
+                Ok(value) => {
+                    request = request.header(name, value);
+                    sent_conditional = true;
+                }
+                Err(_) => eprintln!(
+                    "  Ignoring invalid stored {} header for '{}'",
+                    name.as_str(),
+                    source_name
+                ),
+            }
+        }
+    }
+
+    let response = request.send()?;
+    let validators = response_validators(response.headers(), &resource_key, source_name);
+    if response.status() == StatusCode::NOT_MODIFIED {
+        if !sent_conditional {
+            return Err(format!(
+                "source '{}' returned HTTP 304 without a conditional request",
+                source_name
+            )
+            .into());
+        }
+        return Ok(HttpResponse::NotModified { validators });
+    }
+    if !response.status().is_success() {
+        return Err(format!(
+            "HTTP {}: {}",
+            response.status(),
+            response
+                .status()
+                .canonical_reason()
+                .unwrap_or("Unknown error")
+        )
+        .into());
+    }
+    Ok(HttpResponse::Modified {
+        response,
+        validators,
+    })
+}
+
+fn merge_revalidated_validators(
+    stored: &HttpValidators,
+    returned: Option<HttpValidators>,
+) -> HttpValidators {
+    let Some(returned) = returned else {
+        return stored.clone();
+    };
+    HttpValidators {
+        resource_key: returned.resource_key,
+        etag: returned.etag.or_else(|| stored.etag.clone()),
+        last_modified: returned
+            .last_modified
+            .or_else(|| stored.last_modified.clone()),
+    }
+}
+
+fn fetch_cached_http_response(
+    client: &Client,
+    source_name: &str,
+    url: Url,
+    conditional_enabled: bool,
+    context: &mut RefreshContext,
+) -> Result<CachedHttpResponse, Box<dyn std::error::Error>> {
+    let existing_cache = context
+        .state
+        .source(source_name)
+        .and_then(|status| status.cached_source.clone());
+    let stored_validators = conditional_enabled
+        .then_some(existing_cache.as_ref())
+        .flatten()
+        .and_then(|cached| cached.http_validators.as_ref());
+
+    match send_http_request(client, source_name, url.clone(), stored_validators)? {
+        HttpResponse::Modified {
+            response,
+            validators,
+        } => Ok(CachedHttpResponse::Modified {
+            response,
+            validators,
+        }),
+        HttpResponse::NotModified { validators } => {
+            let Some(mut cached_source) = existing_cache else {
+                return Err(format!(
+                    "source '{}' returned HTTP 304 without a cached body",
+                    source_name
+                )
+                .into());
+            };
+            match read_persistent_cached_body(source_name, context) {
+                Ok(Some(body)) => {
+                    let stored = cached_source
+                        .http_validators
+                        .as_ref()
+                        .ok_or("conditional response is missing stored validators")?;
+                    cached_source.http_validators =
+                        Some(merge_revalidated_validators(stored, validators));
+                    Ok(CachedHttpResponse::NotModified {
+                        body,
+                        cached_source,
+                    })
+                }
+                Ok(None) | Err(_) => {
+                    eprintln!(
+                        "  Cached source '{}' cannot satisfy HTTP 304; retrying unconditionally",
+                        source_name
+                    );
+                    expire_source_cache(&context.cache_dir.clone(), source_name, context);
+                    match send_http_request(client, source_name, url, None)? {
+                        HttpResponse::Modified {
+                            response,
+                            validators,
+                        } => Ok(CachedHttpResponse::Modified {
+                            response,
+                            validators,
+                        }),
+                        HttpResponse::NotModified { .. } => Err(format!(
+                            "source '{}' returned HTTP 304 to an unconditional retry",
+                            source_name
+                        )
+                        .into()),
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn fetch_cached_text_response(
+    client: &Client,
+    source_name: &str,
+    url: Url,
+    context: &mut RefreshContext,
+) -> Result<CachedTextResponse, Box<dyn std::error::Error>> {
+    match fetch_cached_http_response(client, source_name, url.clone(), true, context)? {
+        CachedHttpResponse::Modified {
+            response,
+            validators,
+        } => Ok(CachedTextResponse::Modified {
+            body: response.text()?,
+            validators,
+        }),
+        CachedHttpResponse::NotModified {
+            body,
+            cached_source,
+        } => match String::from_utf8(body) {
+            Ok(body) => Ok(CachedTextResponse::NotModified {
+                body,
+                cached_source,
+            }),
+            Err(_) => {
+                eprintln!(
+                    "  Cached source '{}' is not valid UTF-8; retrying unconditionally",
+                    source_name
+                );
+                expire_source_cache(&context.cache_dir.clone(), source_name, context);
+                match fetch_cached_http_response(client, source_name, url, false, context)? {
+                    CachedHttpResponse::Modified {
+                        response,
+                        validators,
+                    } => Ok(CachedTextResponse::Modified {
+                        body: response.text()?,
+                        validators,
+                    }),
+                    CachedHttpResponse::NotModified { .. } => Err(format!(
+                        "source '{}' returned HTTP 304 to an unconditional retry",
+                        source_name
+                    )
+                    .into()),
+                }
+            }
+        },
+    }
 }
 
 fn fetch_source(
@@ -258,18 +525,46 @@ pub fn retrieve_blocklists_with_resilience(
                 }
             }
         } else {
-            match source.fetch_body(client) {
-                Ok(body) => {
-                    let cached_source = write_cached_body(&context.cache_dir, &source.name, &body)?;
+            let fetched = (|| {
+                let source_url = source.url.as_deref().ok_or("source is missing url")?;
+                println!("  Fetching from {}...", source_url);
+                let url = Url::parse(source_url)?;
+                fetch_cached_text_response(client, &source.name, url, context)
+            })();
+            match fetched {
+                Ok(CachedTextResponse::Modified { body, validators }) => {
+                    let cached_source = retain_or_write_cached_bytes(
+                        &context.cache_dir,
+                        &source.name,
+                        body.as_bytes(),
+                        validators,
+                        context.state.source(&source.name),
+                    )?;
+                    let entry_count = parse_source_body(source, &body, &mut ranges);
+                    println!("  Found {entry_count} entries");
                     context.state.mark_success(
                         &source.name,
                         Utc::now().to_rfc3339(),
                         cached_source,
                     );
-                    let entry_count = parse_source_body(source, &body, &mut ranges);
-                    println!("  Found {entry_count} entries");
                     successful_sources.push(source.name.clone());
                     source_outcomes.push(SourceRefreshOutcome::Fresh {
+                        name: source.name.clone(),
+                    });
+                }
+                Ok(CachedTextResponse::NotModified {
+                    body,
+                    cached_source,
+                }) => {
+                    let entry_count = parse_source_body(source, &body, &mut ranges);
+                    println!("  Source unchanged; found {entry_count} cached entries");
+                    context.state.mark_success(
+                        &source.name,
+                        Utc::now().to_rfc3339(),
+                        cached_source,
+                    );
+                    successful_sources.push(source.name.clone());
+                    source_outcomes.push(SourceRefreshOutcome::NotModified {
                         name: source.name.clone(),
                     });
                 }
@@ -347,22 +642,63 @@ fn add_geoip_with_resilience(
     };
     println!("Processing GeoIP source '{}'...", geoip.name);
     let entries = match geoip_refresh_due(geoip, context) {
-        Ok(true) => match geoip.fetch_database(client).and_then(|body| {
-            let entries = geoip.parse_database(&body)?;
-            let cached = write_cached_bytes(&context.cache_dir, &geoip.name, &body)?;
-            context
-                .state
-                .mark_success(&geoip.name, Utc::now().to_rfc3339(), cached);
-            Ok(entries)
-        }) {
-            Ok(entries) => {
-                successful_sources.push(geoip.name.clone());
-                outcomes.push(SourceRefreshOutcome::Fresh {
-                    name: geoip.name.clone(),
-                });
-                Some(entries)
+        Ok(true) => {
+            println!(
+                "  Fetching {:?} country database for '{}'...",
+                geoip.service, geoip.name
+            );
+            let refreshed = geoip.database_request_url().and_then(|url| {
+                fetch_cached_http_response(
+                    client,
+                    &geoip.name,
+                    url,
+                    context.policy.enabled,
+                    context,
+                )
+            });
+            match refreshed {
+                Ok(CachedHttpResponse::Modified {
+                    response,
+                    validators,
+                }) => response
+                    .bytes()
+                    .map_err(Into::into)
+                    .and_then(|body| {
+                        let entries = geoip.parse_database(&body)?;
+                        let cached = retain_or_write_cached_bytes(
+                            &context.cache_dir,
+                            &geoip.name,
+                            &body,
+                            validators,
+                            context.state.source(&geoip.name),
+                        )?;
+                        context
+                            .state
+                            .mark_success(&geoip.name, Utc::now().to_rfc3339(), cached);
+                        Ok(entries)
+                    })
+                    .inspect(|_| {
+                        successful_sources.push(geoip.name.clone());
+                        outcomes.push(SourceRefreshOutcome::Fresh {
+                            name: geoip.name.clone(),
+                        });
+                    }),
+                Ok(CachedHttpResponse::NotModified {
+                    body,
+                    cached_source,
+                }) => geoip.parse_database(&body).inspect(|_| {
+                    context
+                        .state
+                        .mark_success(&geoip.name, Utc::now().to_rfc3339(), cached_source);
+                    successful_sources.push(geoip.name.clone());
+                    outcomes.push(SourceRefreshOutcome::NotModified {
+                        name: geoip.name.clone(),
+                    });
+                }),
+                Err(error) => Err(error),
             }
-            Err(error) => {
+            .map(Some)
+            .unwrap_or_else(|error| {
                 eprintln!("  Error refreshing GeoIP source '{}': {error}", geoip.name);
                 context
                     .state
@@ -403,8 +739,8 @@ fn add_geoip_with_resilience(
                         None
                     }
                 }
-            }
-        },
+            })
+        }
         Ok(false) => match read_persistent_cached_body(&geoip.name, context) {
             Ok(Some(body)) => match geoip.parse_database(&body) {
                 Ok(entries) => {
@@ -513,6 +849,7 @@ fn prune_inactive_sources(config: &Config, context: &mut RefreshContext) {
     }
 }
 
+#[cfg(test)]
 fn write_cached_body(
     cache_dir: &Path,
     source_name: &str,
@@ -536,7 +873,47 @@ fn write_cached_bytes(
     Ok(CachedSource {
         cache_file,
         sha256: sha256_hex(body),
+        http_validators: None,
     })
+}
+
+fn sha256_file(path: &Path) -> Result<String, std::io::Error> {
+    let mut file = fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(hex::encode(hasher.finalize()))
+}
+
+fn retain_or_write_cached_bytes(
+    cache_dir: &Path,
+    source_name: &str,
+    body: &[u8],
+    http_validators: Option<HttpValidators>,
+    existing_status: Option<&crate::state::BlocklistStatus>,
+) -> Result<CachedSource, Box<dyn std::error::Error>> {
+    let sha256 = sha256_hex(body);
+    if let Some(existing) = existing_status.and_then(|status| status.cached_source.as_ref())
+        && existing.sha256 == sha256
+        && checked_cache_path(cache_dir, &existing.cache_file)
+            .ok()
+            .and_then(|path| sha256_file(&path).ok())
+            .is_some_and(|cached_sha256| cached_sha256 == sha256)
+    {
+        let mut retained = existing.clone();
+        retained.http_validators = http_validators;
+        return Ok(retained);
+    }
+
+    let mut cached = write_cached_bytes(cache_dir, source_name, body)?;
+    cached.http_validators = http_validators;
+    Ok(cached)
 }
 
 fn read_persistent_cached_body(
@@ -633,7 +1010,7 @@ fn remove_cached_body(cache_dir: &Path, cached_source: &CachedSource) {
 mod tests {
     use chrono::{Duration as ChronoDuration, Utc};
     use ipnet::{Ipv4Net, Ipv6Net};
-    use mockito::Server;
+    use mockito::{Matcher, Server};
     use std::io::{Cursor, Write};
 
     use super::*;
@@ -729,6 +1106,440 @@ mod tests {
             .write_all(b"network,country,country_code,continent_code\n192.0.2.0/24,Example,US,NA\n")
             .unwrap();
         writer.finish().unwrap().into_inner()
+    }
+
+    fn cached_with_validators(
+        cache_dir: &Path,
+        source_name: &str,
+        body: &[u8],
+        url: &str,
+        etag: Option<&str>,
+        last_modified: Option<&str>,
+    ) -> CachedSource {
+        let mut cached = write_cached_bytes(cache_dir, source_name, body).unwrap();
+        cached.http_validators = Some(HttpValidators {
+            resource_key: sha256_hex(url.as_bytes()),
+            etag: etag.map(ToString::to_string),
+            last_modified: last_modified.map(ToString::to_string),
+        });
+        cached
+    }
+
+    #[test]
+    fn last_modified_validator_is_sent_without_an_etag() {
+        let mut server = Server::new();
+        let url = format!("{}/source.txt", server.url());
+        let unchanged = server
+            .mock("GET", "/source.txt")
+            .match_header("if-none-match", Matcher::Missing)
+            .match_header("if-modified-since", "Wed, 21 Oct 2015 07:28:00 GMT")
+            .with_status(304)
+            .create();
+        let validators = HttpValidators {
+            resource_key: sha256_hex(url.as_bytes()),
+            etag: None,
+            last_modified: Some("Wed, 21 Oct 2015 07:28:00 GMT".to_string()),
+        };
+
+        let response = send_http_request(
+            &Client::new(),
+            "alpha",
+            Url::parse(&url).unwrap(),
+            Some(&validators),
+        )
+        .unwrap();
+
+        assert!(matches!(response, HttpResponse::NotModified { .. }));
+        unchanged.assert();
+    }
+
+    #[test]
+    fn malformed_stored_validator_is_ignored() {
+        let mut server = Server::new();
+        let url = format!("{}/source.txt", server.url());
+        let fresh = server
+            .mock("GET", "/source.txt")
+            .match_header("if-none-match", Matcher::Missing)
+            .with_status(200)
+            .with_body("192.0.2.0/24\n")
+            .create();
+        let validators = HttpValidators {
+            resource_key: sha256_hex(url.as_bytes()),
+            etag: Some("invalid\nvalue".to_string()),
+            last_modified: None,
+        };
+
+        let response = send_http_request(
+            &Client::new(),
+            "alpha",
+            Url::parse(&url).unwrap(),
+            Some(&validators),
+        )
+        .unwrap();
+
+        assert!(matches!(response, HttpResponse::Modified { .. }));
+        fresh.assert();
+    }
+
+    #[test]
+    fn unsolicited_not_modified_response_is_rejected() {
+        let mut server = Server::new();
+        let url = format!("{}/source.txt", server.url());
+        let unsolicited = server
+            .mock("GET", "/source.txt")
+            .match_header("if-none-match", Matcher::Missing)
+            .match_header("if-modified-since", Matcher::Missing)
+            .with_status(304)
+            .create();
+
+        let error = send_http_request(&Client::new(), "alpha", Url::parse(&url).unwrap(), None)
+            .err()
+            .unwrap();
+
+        assert!(error.to_string().contains("without a conditional request"));
+        unsolicited.assert();
+    }
+
+    #[test]
+    fn normal_source_revalidates_with_etag_and_last_modified() {
+        let mut server = Server::new();
+        let url = format!("{}/source.txt", server.url());
+        let first = server
+            .mock("GET", "/source.txt")
+            .match_header("if-none-match", Matcher::Missing)
+            .match_header("if-modified-since", Matcher::Missing)
+            .with_status(200)
+            .with_header("etag", "\"v1\"")
+            .with_header("last-modified", "Wed, 21 Oct 2015 07:28:00 GMT")
+            .with_body("192.0.2.0/24\n")
+            .create();
+        let directory = tempfile::tempdir().unwrap();
+        let mut context = RefreshContext::new(
+            ResilienceConfig::default().policy().unwrap(),
+            StateFile::default(),
+            directory.path().to_path_buf(),
+        );
+        let config = resilient_config(remote_source("alpha", url));
+
+        let initial =
+            retrieve_blocklists_with_resilience(&Client::new(), &config, &mut context).unwrap();
+        assert_eq!(
+            initial.source_outcomes,
+            vec![SourceRefreshOutcome::Fresh {
+                name: "alpha".to_string()
+            }]
+        );
+        first.assert();
+        first.remove();
+
+        let previous_status = context.state.sources.get_mut("alpha").unwrap();
+        previous_status.last_success_at = Some("2000-01-01T00:00:00Z".to_string());
+        previous_status.last_attempt_at = Some("2000-01-01T00:00:00Z".to_string());
+        previous_status.consecutive_failures = 2;
+        let unchanged = server
+            .mock("GET", "/source.txt")
+            .match_header("if-none-match", "\"v1\"")
+            .match_header("if-modified-since", "Wed, 21 Oct 2015 07:28:00 GMT")
+            .with_status(304)
+            .with_header("etag", "\"v2\"")
+            .create();
+
+        let revalidated =
+            retrieve_blocklists_with_resilience(&Client::new(), &config, &mut context).unwrap();
+
+        assert_eq!(
+            revalidated.source_outcomes,
+            vec![SourceRefreshOutcome::NotModified {
+                name: "alpha".to_string()
+            }]
+        );
+        assert_eq!(
+            revalidated
+                .blocklists
+                .inbound
+                .ipv4_networks()
+                .collect::<Vec<_>>(),
+            vec!["192.0.2.0/24".parse().unwrap()]
+        );
+        let status = context.state.source("alpha").unwrap();
+        assert_eq!(status.consecutive_failures, 0);
+        assert_ne!(
+            status.last_success_at.as_deref(),
+            Some("2000-01-01T00:00:00Z")
+        );
+        let validators = status
+            .cached_source
+            .as_ref()
+            .unwrap()
+            .http_validators
+            .as_ref()
+            .unwrap();
+        assert_eq!(validators.etag.as_deref(), Some("\"v2\""));
+        assert_eq!(
+            validators.last_modified.as_deref(),
+            Some("Wed, 21 Oct 2015 07:28:00 GMT")
+        );
+        unchanged.assert();
+    }
+
+    #[test]
+    fn corrupt_cache_after_304_is_retried_unconditionally() {
+        let mut server = Server::new();
+        let url = format!("{}/source.txt", server.url());
+        let directory = tempfile::tempdir().unwrap();
+        let cached = cached_with_validators(
+            directory.path(),
+            "alpha",
+            b"192.0.2.0/24\n",
+            &url,
+            Some("\"v1\""),
+            None,
+        );
+        std::fs::write(directory.path().join(&cached.cache_file), "corrupt\n").unwrap();
+        let mut state = StateFile::default();
+        state.mark_success("alpha", Utc::now().to_rfc3339(), cached);
+        let mut context = RefreshContext::new(
+            ResilienceConfig::default().policy().unwrap(),
+            state,
+            directory.path().to_path_buf(),
+        );
+        let not_modified = server
+            .mock("GET", "/source.txt")
+            .match_header("if-none-match", "\"v1\"")
+            .with_status(304)
+            .create();
+        let replacement = server
+            .mock("GET", "/source.txt")
+            .match_header("if-none-match", Matcher::Missing)
+            .with_status(200)
+            .with_header("etag", "\"v2\"")
+            .with_body("198.51.100.0/24\n")
+            .create();
+
+        let retrieved = retrieve_blocklists_with_resilience(
+            &Client::new(),
+            &resilient_config(remote_source("alpha", url)),
+            &mut context,
+        )
+        .unwrap();
+
+        assert_eq!(
+            retrieved.source_outcomes,
+            vec![SourceRefreshOutcome::Fresh {
+                name: "alpha".to_string()
+            }]
+        );
+        assert_eq!(
+            retrieved
+                .blocklists
+                .inbound
+                .ipv4_networks()
+                .collect::<Vec<_>>(),
+            vec!["198.51.100.0/24".parse().unwrap()]
+        );
+        not_modified.assert();
+        replacement.assert();
+    }
+
+    #[test]
+    fn changed_resource_identity_does_not_send_old_validators() {
+        let mut server = Server::new();
+        let old_url = format!("{}/old.txt", server.url());
+        let new_url = format!("{}/new.txt", server.url());
+        let directory = tempfile::tempdir().unwrap();
+        let cached = cached_with_validators(
+            directory.path(),
+            "alpha",
+            b"192.0.2.0/24\n",
+            &old_url,
+            Some("\"old\""),
+            None,
+        );
+        let mut state = StateFile::default();
+        state.mark_success("alpha", Utc::now().to_rfc3339(), cached);
+        let mut context = RefreshContext::new(
+            ResilienceConfig::default().policy().unwrap(),
+            state,
+            directory.path().to_path_buf(),
+        );
+        let fresh = server
+            .mock("GET", "/new.txt")
+            .match_header("if-none-match", Matcher::Missing)
+            .with_status(200)
+            .with_body("198.51.100.0/24\n")
+            .create();
+
+        let retrieved = retrieve_blocklists_with_resilience(
+            &Client::new(),
+            &resilient_config(remote_source("alpha", new_url)),
+            &mut context,
+        )
+        .unwrap();
+
+        assert!(matches!(
+            retrieved.source_outcomes.as_slice(),
+            [SourceRefreshOutcome::Fresh { .. }]
+        ));
+        assert!(
+            context
+                .state
+                .source("alpha")
+                .unwrap()
+                .cached_source
+                .as_ref()
+                .unwrap()
+                .http_validators
+                .is_none()
+        );
+        fresh.assert();
+    }
+
+    #[test]
+    fn due_geoip_source_uses_conditional_request() {
+        let mut server = Server::new();
+        let url = format!("{}/country.zip", server.url());
+        let directory = tempfile::tempdir().unwrap();
+        let cached = cached_with_validators(
+            directory.path(),
+            "iplocate-country",
+            &geoip_zip(),
+            &url,
+            Some("\"geo-v1\""),
+            None,
+        );
+        let mut state = StateFile::default();
+        state.mark_success(
+            "iplocate-country",
+            "2000-01-01T00:00:00Z".to_string(),
+            cached,
+        );
+        let mut context = RefreshContext::new(
+            ResilienceConfig::default().policy().unwrap(),
+            state,
+            directory.path().to_path_buf(),
+        );
+        let unchanged = server
+            .mock("GET", "/country.zip")
+            .match_header("if-none-match", "\"geo-v1\"")
+            .with_status(304)
+            .create();
+        let config = Config {
+            blocklists: Vec::new(),
+            allowlists: Vec::new(),
+            geoip: Some(geoip_config(url)),
+            web: None,
+            output: Default::default(),
+            schedule: None,
+            resilience: ResilienceConfig::default(),
+        };
+
+        let retrieved =
+            retrieve_blocklists_with_resilience(&Client::new(), &config, &mut context).unwrap();
+
+        assert_eq!(
+            retrieved.source_outcomes,
+            vec![SourceRefreshOutcome::NotModified {
+                name: "iplocate-country".to_string()
+            }]
+        );
+        assert_eq!(
+            retrieved
+                .blocklists
+                .inbound
+                .ipv4_networks()
+                .collect::<Vec<_>>(),
+            vec!["192.0.2.0/24".parse().unwrap()]
+        );
+        unchanged.assert();
+    }
+
+    #[test]
+    fn resilience_disabled_suppresses_geoip_conditionals() {
+        let mut server = Server::new();
+        let url = format!("{}/country.zip", server.url());
+        let directory = tempfile::tempdir().unwrap();
+        let cached = cached_with_validators(
+            directory.path(),
+            "iplocate-country",
+            &geoip_zip(),
+            &url,
+            Some("\"geo-v1\""),
+            None,
+        );
+        let mut state = StateFile::default();
+        state.mark_success(
+            "iplocate-country",
+            "2000-01-01T00:00:00Z".to_string(),
+            cached,
+        );
+        let mut context = RefreshContext::new(
+            ResiliencePolicy {
+                enabled: false,
+                max_stale_age: std::time::Duration::from_secs(1),
+                max_consecutive_failures: 1,
+            },
+            state,
+            directory.path().to_path_buf(),
+        );
+        let fresh = server
+            .mock("GET", "/country.zip")
+            .match_header("if-none-match", Matcher::Missing)
+            .with_status(200)
+            .with_body(geoip_zip())
+            .create();
+        let config = Config {
+            blocklists: Vec::new(),
+            allowlists: Vec::new(),
+            geoip: Some(geoip_config(url)),
+            web: None,
+            output: Default::default(),
+            schedule: None,
+            resilience: ResilienceConfig::default(),
+        };
+
+        let retrieved =
+            retrieve_blocklists_with_resilience(&Client::new(), &config, &mut context).unwrap();
+
+        assert!(matches!(
+            retrieved.source_outcomes.as_slice(),
+            [SourceRefreshOutcome::Fresh { .. }]
+        ));
+        fresh.assert();
+    }
+
+    #[test]
+    fn identical_body_retains_existing_cache_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let body = b"192.0.2.0/24\n";
+        let legacy_path = directory.path().join("legacy.body");
+        std::fs::write(&legacy_path, body).unwrap();
+        let status = crate::state::BlocklistStatus {
+            last_success_at: Some(Utc::now().to_rfc3339()),
+            last_attempt_at: None,
+            consecutive_failures: 0,
+            cached_source: Some(CachedSource {
+                cache_file: "legacy.body".to_string(),
+                sha256: sha256_hex(body),
+                http_validators: None,
+            }),
+        };
+        let validators = HttpValidators {
+            resource_key: "resource".to_string(),
+            etag: Some("\"v2\"".to_string()),
+            last_modified: None,
+        };
+
+        let retained = retain_or_write_cached_bytes(
+            directory.path(),
+            "alpha",
+            body,
+            Some(validators.clone()),
+            Some(&status),
+        )
+        .unwrap();
+
+        assert_eq!(retained.cache_file, "legacy.body");
+        assert_eq!(retained.http_validators, Some(validators));
     }
 
     #[test]
