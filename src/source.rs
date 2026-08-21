@@ -7,6 +7,8 @@ use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::ranges::IpRangeAccumulator;
+
 /// Configuration for a single list source.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct SourceConfig {
@@ -68,17 +70,34 @@ pub(crate) enum IpAddrNet {
 }
 
 impl SourceConfig {
-    /// Parse a source body into IP networks.
-    pub fn parse(&self, body: &str) -> Vec<IpNet> {
+    /// Parse a source body directly into compact IP range storage.
+    pub fn parse_into(&self, body: &str, ranges: &mut IpRangeAccumulator) -> usize {
+        self.visit_entries(body, |entry| ranges.add(entry))
+    }
+
+    #[cfg(test)]
+    fn parse(&self, body: &str) -> Vec<IpNet> {
+        let mut entries = Vec::new();
+        self.visit_entries(body, |entry| entries.push(entry));
+        entries
+    }
+
+    pub(crate) fn visit_entries<F>(&self, body: &str, visit: F) -> usize
+    where
+        F: FnMut(IpNet),
+    {
         if self.net_json.is_some() {
-            self.parse_json(body)
+            self.visit_json(body, visit)
         } else {
-            self.parse_text(body)
+            self.visit_text(body, visit)
         }
     }
 
-    fn parse_text(&self, body: &str) -> Vec<IpNet> {
-        let mut entries = Vec::new();
+    fn visit_text<F>(&self, body: &str, mut visit: F) -> usize
+    where
+        F: FnMut(IpNet),
+    {
+        let mut entry_count = 0;
         let mut warning_count = 0;
         for (line_number, line) in body.lines().enumerate() {
             let mut line = line.trim();
@@ -92,7 +111,10 @@ impl SourceConfig {
                 continue;
             }
             match self.parse_line(line) {
-                Ok(entry) => entries.push(entry),
+                Ok(entry) => {
+                    visit(entry);
+                    entry_count += 1;
+                }
                 Err(err) => {
                     if warning_count < 10 {
                         eprintln!(
@@ -109,49 +131,53 @@ impl SourceConfig {
                 }
             }
         }
-        entries
+        entry_count
     }
 
-    fn parse_json(&self, body: &str) -> Vec<IpNet> {
-        let mut entries = Vec::new();
+    fn visit_json<F>(&self, body: &str, mut visit: F) -> usize
+    where
+        F: FnMut(IpNet),
+    {
+        let mut entry_count = 0;
         let mut warning_count = 0;
         let Some(path) = self.net_json.as_deref() else {
-            return entries;
+            return 0;
         };
         let json: Value = match serde_json::from_str(body) {
             Ok(value) => value,
             Err(err) => {
                 eprintln!("  Warning parsing JSON body: {}", err);
-                return entries;
+                return 0;
             }
         };
         let path_segments: Vec<&str> = path
             .split('/')
             .filter(|segment| !segment.is_empty())
             .collect();
-        for value in self.json_path_values(&json, &path_segments) {
-            match value {
-                Value::String(entry) => match self.parse_ip_or_net(entry) {
-                    Ok(net) => entries.push(net),
-                    Err(err) => Self::warn_json(
-                        &mut warning_count,
-                        format!(
-                            "  Warning parsing JSON value '{}' at '{}': {}",
-                            entry, path, err
-                        ),
-                    ),
-                },
-                other => Self::warn_json(
+        self.visit_json_path_values(&json, &path_segments, &mut |value| match value {
+            Value::String(entry) => match self.parse_ip_or_net(entry) {
+                Ok(net) => {
+                    visit(net);
+                    entry_count += 1;
+                }
+                Err(err) => Self::warn_json(
                     &mut warning_count,
                     format!(
-                        "  Warning parsing JSON value at '{}': expected string, found {}",
-                        path,
-                        Self::json_value_type(other)
+                        "  Warning parsing JSON value '{}' at '{}': {}",
+                        entry, path, err
                     ),
                 ),
-            }
-        }
-        entries
+            },
+            other => Self::warn_json(
+                &mut warning_count,
+                format!(
+                    "  Warning parsing JSON value at '{}': expected string, found {}",
+                    path,
+                    Self::json_value_type(other)
+                ),
+            ),
+        });
+        entry_count
     }
 
     fn warn_json(warning_count: &mut usize, message: String) {
@@ -165,11 +191,8 @@ impl SourceConfig {
     }
 
     pub(crate) fn parse_line(&self, line: &str) -> Result<IpNet, Box<dyn std::error::Error>> {
-        let fields: Vec<&str> = self.field_separator.as_deref().map_or_else(
-            || line.split_whitespace().collect(),
-            |separator| line.split(separator).collect(),
-        );
-        match self.extract_ip(&fields)? {
+        let entry = self.line_field(line, self.extract_field.unwrap_or(0))?;
+        match self.parse_ip_entry(entry)? {
             IpAddrNet::Net(net) => {
                 if self.prefix_field.is_some() {
                     eprintln!(
@@ -182,12 +205,49 @@ impl SourceConfig {
             IpAddrNet::Addr(ip) => self.ip_to_net(
                 ip,
                 self.prefix_field
-                    .map(|_| self.extract_prefix(&fields))
+                    .map(|index| {
+                        let prefix_entry = self.line_field(line, index)?;
+                        prefix_entry.parse::<usize>().map_err(|err| {
+                            Box::<dyn std::error::Error>::from(format!(
+                                "failed to parse prefix from '{}': {}",
+                                prefix_entry, err
+                            ))
+                        })
+                    })
                     .transpose()?,
             ),
         }
     }
 
+    fn line_field<'a>(
+        &self,
+        line: &'a str,
+        index: usize,
+    ) -> Result<&'a str, Box<dyn std::error::Error>> {
+        let field = match self.field_separator.as_deref() {
+            Some(separator) => line.split(separator).nth(index),
+            None => line.split_whitespace().nth(index),
+        };
+        field.map(str::trim).ok_or_else(|| {
+            format!(
+                "field index {} out of bounds while parsing '{}'",
+                index, line
+            )
+            .into()
+        })
+    }
+
+    fn parse_ip_entry(&self, entry: &str) -> Result<IpAddrNet, Box<dyn std::error::Error>> {
+        if let Ok(net) = entry.parse::<IpNet>() {
+            Ok(IpAddrNet::Net(net))
+        } else if let Ok(ip) = entry.parse::<IpAddr>() {
+            Ok(IpAddrNet::Addr(ip))
+        } else {
+            Err(format!("failed to parse IP or CIDR from '{}'", entry).into())
+        }
+    }
+
+    #[cfg(test)]
     pub(crate) fn extract_field_entry(
         &self,
         fields: &[&str],
@@ -210,20 +270,16 @@ impl SourceConfig {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn extract_ip(
         &self,
         fields: &[&str],
     ) -> Result<IpAddrNet, Box<dyn std::error::Error>> {
         let entry = self.extract_field_entry(fields, self.extract_field)?;
-        if let Ok(net) = entry.parse::<IpNet>() {
-            Ok(IpAddrNet::Net(net))
-        } else if let Ok(ip) = entry.parse::<IpAddr>() {
-            Ok(IpAddrNet::Addr(ip))
-        } else {
-            Err(format!("failed to parse IP or CIDR from '{}'", entry).into())
-        }
+        self.parse_ip_entry(&entry)
     }
 
+    #[cfg(test)]
     pub(crate) fn extract_prefix(
         &self,
         fields: &[&str],
@@ -261,20 +317,26 @@ impl SourceConfig {
         }
     }
 
-    fn json_path_values<'a>(&self, value: &'a Value, path_segments: &[&str]) -> Vec<&'a Value> {
+    fn visit_json_path_values<F>(&self, value: &Value, path_segments: &[&str], visit: &mut F)
+    where
+        F: FnMut(&Value),
+    {
         if path_segments.is_empty() {
-            return vec![value];
+            visit(value);
+            return;
         }
         match value {
-            Value::Array(items) => items
-                .iter()
-                .flat_map(|item| self.json_path_values(item, path_segments))
-                .collect(),
-            Value::Object(map) => map
-                .get(path_segments[0])
-                .map(|next| self.json_path_values(next, &path_segments[1..]))
-                .unwrap_or_default(),
-            _ => Vec::new(),
+            Value::Array(items) => {
+                for item in items {
+                    self.visit_json_path_values(item, path_segments, visit);
+                }
+            }
+            Value::Object(map) => {
+                if let Some(next) = map.get(path_segments[0]) {
+                    self.visit_json_path_values(next, &path_segments[1..], visit);
+                }
+            }
+            _ => {}
         }
     }
 
@@ -289,28 +351,38 @@ impl SourceConfig {
         }
     }
 
-    pub(crate) fn fetch_list(
+    pub(crate) fn fetch_and_visit<F>(
         &self,
         client: &Client,
-    ) -> Result<Vec<IpNet>, Box<dyn std::error::Error>> {
+        mut visit: F,
+    ) -> Result<usize, Box<dyn std::error::Error>>
+    where
+        F: FnMut(IpNet),
+    {
         if let Some(entries) = self.net_list.as_deref() {
-            let entries = self.inline_entries(entries);
-            println!("  Found {} inline entries", entries.len());
-            Ok(entries)
+            let entry_count = self.visit_inline_entries(entries, visit);
+            println!("  Found {entry_count} inline entries");
+            Ok(entry_count)
         } else {
             let body = self.fetch_body(client)?;
-            let entries = self.parse(&body);
-            println!("  Found {} entries", entries.len());
-            Ok(entries)
+            let entry_count = self.visit_entries(&body, &mut visit);
+            println!("  Found {entry_count} entries");
+            Ok(entry_count)
         }
     }
 
-    fn inline_entries(&self, entries: &[String]) -> Vec<IpNet> {
-        let mut nets = Vec::new();
+    pub(crate) fn visit_inline_entries<F>(&self, entries: &[String], mut visit: F) -> usize
+    where
+        F: FnMut(IpNet),
+    {
+        let mut entry_count = 0;
         let mut warning_count = 0;
         for (index, entry) in entries.iter().enumerate() {
             match self.parse_ip_or_net(entry) {
-                Ok(net) => nets.push(net),
+                Ok(net) => {
+                    visit(net);
+                    entry_count += 1;
+                }
                 Err(err) if warning_count < 10 => {
                     eprintln!(
                         "  Warning parsing net_list entry {} '{}': {}",
@@ -326,7 +398,7 @@ impl SourceConfig {
                 Err(_) => {}
             }
         }
-        nets
+        entry_count
     }
 
     /// Download an unparsed source body for resilient caching.
@@ -354,6 +426,10 @@ impl SourceConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fmt::Write as _;
+    use std::io::Write as _;
+
+    use crate::output::format_blocklist_output;
     use crate::test_support::{net, test_source};
 
     fn source() -> SourceConfig {
@@ -377,11 +453,20 @@ mod tests {
         value.parse().unwrap()
     }
 
+    fn parsed_entries(source: &SourceConfig, body: &str) -> Vec<IpNet> {
+        let mut entries = Vec::new();
+        source.visit_entries(body, |entry| entries.push(entry));
+        entries
+    }
+
     #[test]
     fn parses_text_with_comments_and_whitespace() {
         let source = source();
         assert_eq!(
-            source.parse("\n # ignore\n 192.0.2.1 # comment\n2001:db8::/32\n"),
+            parsed_entries(
+                &source,
+                "\n # ignore\n 192.0.2.1 # comment\n2001:db8::/32\n"
+            ),
             vec![network("192.0.2.1/32"), network("2001:db8::/32")]
         );
     }
@@ -406,7 +491,10 @@ mod tests {
         source.net_json = Some("prefixes/address".to_string());
 
         assert_eq!(
-            source.parse(r#"{"prefixes":[{"address":"198.51.100.8"},{"address":7},{"address":"2001:db8::/32"}]}"#),
+            parsed_entries(
+                &source,
+                r#"{"prefixes":[{"address":"198.51.100.8"},{"address":7},{"address":"2001:db8::/32"}]}"#,
+            ),
             vec![network("198.51.100.8/32"), network("2001:db8::/32")]
         );
     }
@@ -416,8 +504,12 @@ mod tests {
         let mut source = source();
         source.net_list = Some(vec!["10.0.0.0/8".to_string(), "2001:db8::/32".to_string()]);
 
+        let mut entries = Vec::new();
+        source
+            .fetch_and_visit(&Client::new(), |entry| entries.push(entry))
+            .unwrap();
         assert_eq!(
-            source.fetch_list(&Client::new()).unwrap(),
+            entries,
             vec![network("10.0.0.0/8"), network("2001:db8::/32")]
         );
     }
@@ -1113,8 +1205,63 @@ mod tests {
         };
 
         let client = Client::new();
-        let result = source.fetch_list(&client).unwrap();
+        let mut result = Vec::new();
+        source
+            .fetch_and_visit(&client, |entry| result.push(entry))
+            .unwrap();
 
         assert_eq!(result, vec![net("10.0.0.0/8"), net("2001:db8::/32")]);
+    }
+
+    /// Run with:
+    /// cargo test --release source::tests::processes_4_2m_entries_under_512_memory_budget -- --ignored --exact --nocapture
+    #[test]
+    #[ignore = "release-mode 4.2-million-entry memory and throughput validation"]
+    fn processes_4_2m_entries_under_512_memory_budget() {
+        const ENTRY_COUNT: usize = 4_228_762;
+        const HASH_MULTIPLIER: u32 = 0x9e37_79b1;
+
+        let mut body = String::with_capacity(ENTRY_COUNT * 16);
+        for index in 0..ENTRY_COUNT {
+            let address = std::net::Ipv4Addr::from((index as u32).wrapping_mul(HASH_MULTIPLIER));
+            writeln!(&mut body, "{address}").unwrap();
+        }
+
+        let mut accumulator = IpRangeAccumulator::new();
+        let parsed = source().parse_into(&body, &mut accumulator);
+        assert_eq!(parsed, ENTRY_COUNT);
+        drop(body);
+
+        let ranges = accumulator.finalize();
+        let covered_addresses: u64 = ranges
+            .ipv4_networks()
+            .map(|network| 1_u64 << (32 - network.prefix_len()))
+            .sum();
+        assert_eq!(covered_addresses, ENTRY_COUNT as u64);
+
+        let (output, output_entries) = format_blocklist_output(&ranges);
+        assert!(output_entries > 0);
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(output.as_bytes()).unwrap();
+        file.flush().unwrap();
+        assert!(file.as_file().metadata().unwrap().len() > 0);
+
+        #[cfg(target_os = "linux")]
+        {
+            const MEMORY_BUDGET_KIB: u64 = 512 * 1024;
+            let status = std::fs::read_to_string("/proc/self/status").unwrap();
+            let peak_kib = status
+                .lines()
+                .find_map(|line| line.strip_prefix("VmHWM:"))
+                .and_then(|value| value.split_whitespace().next())
+                .unwrap()
+                .parse::<u64>()
+                .unwrap();
+            eprintln!("scale-test peak RSS: {peak_kib} KiB");
+            assert!(
+                peak_kib < MEMORY_BUDGET_KIB,
+                "peak RSS {peak_kib} KiB exceeded the 512 MiB memory budget"
+            );
+        }
     }
 }

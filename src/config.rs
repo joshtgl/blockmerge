@@ -373,7 +373,7 @@ timestamp_header = false
         let source1 = config.source_by_name("source1").unwrap();
         assert_eq!(source1.name, "source1");
         assert_eq!(source1.url.as_deref(), Some("http://example.com/list1.txt"));
-        assert_eq!(source1.enabled, true);
+        assert!(source1.enabled);
         assert_eq!(source1.direction, Direction::Inbound);
         assert_eq!(source1.list_type, ListType::Blocklist);
 
@@ -389,8 +389,8 @@ timestamp_header = false
             source2.net_list.as_deref(),
             Some(&["10.0.0.0/8".to_string(), "::1/128".to_string()][..])
         );
-        assert_eq!(source2.rate_limited, true);
-        assert_eq!(source2.enabled, false);
+        assert!(source2.rate_limited);
+        assert!(!source2.enabled);
         assert_eq!(source2.direction, Direction::Inbound);
 
         fs::remove_file(temp_file).unwrap();

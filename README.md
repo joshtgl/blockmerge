@@ -75,6 +75,18 @@ timestamp_header = true # set false for CIDR-only output
 
 Blockmerge compares generated CIDR content with the existing file, ignoring that header. Unchanged directional lists are not rewritten, so their timestamp records the last actual list-content update.
 
+### Large-list memory validation
+
+An ignored release-mode test exercises parsing, merging, rendering, and writing 4,228,762 deterministic IPv4 entries. On Linux, it reads its own peak resident memory from `/proc/self/status` and verifies that it remains below 512 MiB:
+
+```bash
+cargo test --release \
+  source::tests::processes_4_2m_entries_under_512_memory_budget \
+  -- --ignored --exact --nocapture
+```
+
+The expected maximum resident set size is below the 512 MiB memory budget.
+
 ## Offline snapshots
 
 Run `blockmerge-download-raw --output-dir <directory>` to save raw source bodies and write a `manifest.json`. The manifest is a required versioned JSON document whose entries include a relative filename, source URL when applicable, SHA-256 checksum, and download timestamp. `blockmerge-offline-generate` verifies every checksum before parsing the saved bodies with the current `blockmerge.toml` rules.

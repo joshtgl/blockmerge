@@ -5,11 +5,10 @@ use blockmerge::{
     config::{Config, load_config},
     offline::{DownloadManifestEntry, load_manifest, sha256_hex},
     output::{directional_output_paths, format_blocklist_output},
-    ranges::merge_blocklist_entries_with_allowlist,
+    ranges::IpRangeAccumulator,
     source::{Direction, ListType},
 };
 use clap::Parser;
-use ipnet::IpNet;
 
 /// Generate blocklist output from previously downloaded offline blocklists.
 #[derive(Parser, Debug)]
@@ -51,7 +50,7 @@ struct OfflineInput {
 struct ParsedSourceEntries {
     direction: Direction,
     list_type: ListType,
-    entries: Vec<IpNet>,
+    entries: IpRangeAccumulator,
 }
 
 fn source_name_from_file(path: &Path) -> Option<String> {
@@ -129,8 +128,9 @@ fn read_source_entries(
         }
         println!("Reading '{}' from {}...", input.name, input.path.display());
         let body = read_verified_body(input)?;
-        let entries = source.parse(&body);
-        println!("  Found {} entries", entries.len());
+        let mut entries = IpRangeAccumulator::new();
+        let entry_count = source.parse_into(&body, &mut entries);
+        println!("  Found {entry_count} entries");
         return Ok(vec![ParsedSourceEntries {
             direction: source.direction,
             list_type: source.list_type,
@@ -208,10 +208,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .collect()
     };
 
-    let mut inbound_blocklist_entries = Vec::new();
-    let mut outbound_blocklist_entries = Vec::new();
-    let mut inbound_allowlist_entries = Vec::new();
-    let mut outbound_allowlist_entries = Vec::new();
+    let mut inbound_blocklist_entries = IpRangeAccumulator::new();
+    let mut outbound_blocklist_entries = IpRangeAccumulator::new();
+    let mut inbound_allowlist_entries = IpRangeAccumulator::new();
+    let mut outbound_allowlist_entries = IpRangeAccumulator::new();
     let mut processed_sources = 0;
     let mut parsed_entries = 0;
 
@@ -225,38 +225,38 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             parsed_entries += entries.len();
             match (list_type, direction) {
                 (ListType::Blocklist, Direction::Inbound) => {
-                    inbound_blocklist_entries.extend(entries)
+                    inbound_blocklist_entries.append(entries)
                 }
                 (ListType::Blocklist, Direction::Outbound) => {
-                    outbound_blocklist_entries.extend(entries)
+                    outbound_blocklist_entries.append(entries)
                 }
                 (ListType::Blocklist, Direction::Both) => {
-                    inbound_blocklist_entries.extend(entries.iter().copied());
-                    outbound_blocklist_entries.extend(entries);
+                    inbound_blocklist_entries.append(entries.clone());
+                    outbound_blocklist_entries.append(entries);
                 }
                 (ListType::Allowlist, Direction::Inbound) => {
-                    inbound_allowlist_entries.extend(entries)
+                    inbound_allowlist_entries.append(entries)
                 }
                 (ListType::Allowlist, Direction::Outbound) => {
-                    outbound_allowlist_entries.extend(entries)
+                    outbound_allowlist_entries.append(entries)
                 }
                 (ListType::Allowlist, Direction::Both) => {
-                    inbound_allowlist_entries.extend(entries.iter().copied());
-                    outbound_allowlist_entries.extend(entries);
+                    inbound_allowlist_entries.append(entries.clone());
+                    outbound_allowlist_entries.append(entries);
                 }
             }
             processed_sources += 1;
         }
     }
 
-    let inbound_blocklist = merge_blocklist_entries_with_allowlist(
-        inbound_blocklist_entries,
-        inbound_allowlist_entries,
-    );
-    let outbound_blocklist = merge_blocklist_entries_with_allowlist(
-        outbound_blocklist_entries,
-        outbound_allowlist_entries,
-    );
+    let inbound_allowlist = inbound_allowlist_entries.finalize();
+    let outbound_allowlist = outbound_allowlist_entries.finalize();
+    let inbound_blocklist = inbound_blocklist_entries
+        .finalize()
+        .subtract(&inbound_allowlist);
+    let outbound_blocklist = outbound_blocklist_entries
+        .finalize()
+        .subtract(&outbound_allowlist);
     let (inbound_output, inbound_final_entries) = format_blocklist_output(&inbound_blocklist);
     let (outbound_output, outbound_final_entries) = format_blocklist_output(&outbound_blocklist);
     let (inbound_path, outbound_path) = directional_output_paths(&args.output);

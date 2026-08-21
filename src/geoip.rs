@@ -9,6 +9,7 @@ use reqwest::{Url, blocking::Client};
 use serde::Deserialize;
 use zip::ZipArchive;
 
+use crate::ranges::IpRangeAccumulator;
 use crate::source::Direction;
 
 const MIN_REFRESH_INTERVAL: Duration = Duration::from_secs(24 * 60 * 60);
@@ -90,8 +91,8 @@ pub struct GeoIpPolicy {
 /// Directional networks selected from a GeoIP database.
 #[derive(Debug, Default)]
 pub struct GeoIpEntries {
-    pub inbound: Vec<IpNet>,
-    pub outbound: Vec<IpNet>,
+    pub inbound: IpRangeAccumulator,
+    pub outbound: IpRangeAccumulator,
     /// CSV records retained because their country code matches a configured rule.
     pub selected_records: usize,
     /// CSV records excluded because their country code has no configured rule.
@@ -295,11 +296,11 @@ impl GeoIpConfig {
             matched.insert(country.to_string());
             entries.selected_records += 1;
             match direction {
-                Direction::Inbound => entries.inbound.push(network),
-                Direction::Outbound => entries.outbound.push(network),
+                Direction::Inbound => entries.inbound.add(network),
+                Direction::Outbound => entries.outbound.add(network),
                 Direction::Both => {
-                    entries.inbound.push(network);
-                    entries.outbound.push(network);
+                    entries.inbound.add(network);
+                    entries.outbound.add(network);
                 }
             }
         }
@@ -439,7 +440,14 @@ mod tests {
             .parse_database(b"cidr,country\n192.0.2.0/24,US\n198.51.100.0/24,CA\n")
             .unwrap();
         assert_eq!(entries.selected_records, 1);
-        assert_eq!(entries.inbound, vec!["192.0.2.0/24".parse().unwrap()]);
+        assert_eq!(
+            entries
+                .inbound
+                .finalize()
+                .ipv4_networks()
+                .collect::<Vec<_>>(),
+            vec!["192.0.2.0/24".parse().unwrap()]
+        );
     }
 
     #[test]

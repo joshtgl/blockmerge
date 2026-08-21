@@ -1,7 +1,7 @@
 //! Rendering and safely writing generated blocklist files.
 
 use std::fs::{self, File};
-use std::io::{BufRead, BufReader, Read};
+use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 
 use chrono::{SecondsFormat, Utc};
@@ -28,12 +28,12 @@ pub struct OutputWriteResult {
 pub fn format_blocklist_output(blocklist: &IpRanges) -> (String, usize) {
     let mut output = String::new();
     let mut final_entries = 0;
-    for network in blocklist.final_ipv4() {
+    for network in blocklist.ipv4_networks() {
         output.push_str(&network.to_string());
         output.push('\n');
         final_entries += 1;
     }
-    for network in blocklist.final_ipv6() {
+    for network in blocklist.ipv6_networks() {
         output.push_str(&network.to_string());
         output.push('\n');
         final_entries += 1;
@@ -241,13 +241,13 @@ fn write_output_if_changed(
     match existing_output_matches(path, payload, timestamp_header) {
         Ok(true) => return Ok(false),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return write_new_output(path, &render_output(payload, timestamp_header, timestamp));
+            return write_new_output(path, payload, timestamp_header, timestamp);
         }
         Err(error) => return Err(error.into()),
         Ok(false) => {}
     }
 
-    write_new_output(path, &render_output(payload, timestamp_header, timestamp))
+    write_new_output(path, payload, timestamp_header, timestamp)
 }
 
 /// Compare an existing output file with a generated payload without loading the
@@ -354,9 +354,14 @@ enum TimestampHeaderState {
     Malformed,
 }
 
-fn write_new_output(path: &Path, content: &str) -> Result<bool, Box<dyn std::error::Error>> {
+fn write_new_output(
+    path: &Path,
+    payload: &str,
+    timestamp_header: bool,
+    timestamp: &str,
+) -> Result<bool, Box<dyn std::error::Error>> {
     let temporary_path = temp_output_path(path);
-    if let Err(error) = write_atomic_temp(&temporary_path, content) {
+    if let Err(error) = write_output_temp(&temporary_path, payload, timestamp_header, timestamp) {
         cleanup_temp_file(&temporary_path);
         return Err(error);
     }
@@ -367,12 +372,23 @@ fn write_new_output(path: &Path, content: &str) -> Result<bool, Box<dyn std::err
     Ok(true)
 }
 
-fn render_output(payload: &str, timestamp_header: bool, timestamp: &str) -> String {
+fn write_output_temp(
+    path: &Path,
+    payload: &str,
+    timestamp_header: bool,
+    timestamp: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let parent = path.parent().unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent)?;
+    let mut writer = BufWriter::new(File::create(path)?);
     if timestamp_header {
-        format!("{TIMESTAMP_HEADER_PREFIX}{timestamp}\n{payload}")
-    } else {
-        payload.to_string()
+        writer.write_all(TIMESTAMP_HEADER_PREFIX.as_bytes())?;
+        writer.write_all(timestamp.as_bytes())?;
+        writer.write_all(b"\n")?;
     }
+    writer.write_all(payload.as_bytes())?;
+    writer.flush()?;
+    Ok(())
 }
 
 fn temp_output_path(path: &Path) -> PathBuf {

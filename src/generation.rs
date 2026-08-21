@@ -11,7 +11,7 @@ use tempfile::NamedTempFile;
 use crate::config::{Config, ResiliencePolicy};
 use crate::geoip::{GeoIpConfig, GeoIpEntries};
 use crate::offline::sha256_hex;
-use crate::ranges::{DirectionalBlocklists, IpRanges, finalize};
+use crate::ranges::{DirectionalBlocklists, IpRangeAccumulator};
 use crate::source::{Direction, ListType};
 use crate::state::{CachedSource, StateFile};
 
@@ -60,15 +60,74 @@ impl RefreshContext {
     }
 }
 
+#[derive(Default)]
+struct RangeAccumulators {
+    inbound_blocklist: IpRangeAccumulator,
+    outbound_blocklist: IpRangeAccumulator,
+    inbound_allowlist: IpRangeAccumulator,
+    outbound_allowlist: IpRangeAccumulator,
+}
+
+impl RangeAccumulators {
+    fn add(&mut self, list_type: ListType, direction: Direction, entry: ipnet::IpNet) {
+        match (list_type, direction) {
+            (ListType::Blocklist, Direction::Inbound) => self.inbound_blocklist.add(entry),
+            (ListType::Blocklist, Direction::Outbound) => self.outbound_blocklist.add(entry),
+            (ListType::Blocklist, Direction::Both) => {
+                self.inbound_blocklist.add(entry);
+                self.outbound_blocklist.add(entry);
+            }
+            (ListType::Allowlist, Direction::Inbound) => self.inbound_allowlist.add(entry),
+            (ListType::Allowlist, Direction::Outbound) => self.outbound_allowlist.add(entry),
+            (ListType::Allowlist, Direction::Both) => {
+                self.inbound_allowlist.add(entry);
+                self.outbound_allowlist.add(entry);
+            }
+        }
+    }
+
+    fn finalize(self) -> DirectionalBlocklists {
+        let inbound_allowlist = self.inbound_allowlist.finalize();
+        let outbound_allowlist = self.outbound_allowlist.finalize();
+        DirectionalBlocklists {
+            inbound: self
+                .inbound_blocklist
+                .finalize()
+                .subtract(&inbound_allowlist),
+            outbound: self
+                .outbound_blocklist
+                .finalize()
+                .subtract(&outbound_allowlist),
+        }
+    }
+}
+
+fn parse_source_body(
+    source: &crate::source::SourceConfig,
+    body: &str,
+    ranges: &mut RangeAccumulators,
+) -> usize {
+    source.visit_entries(body, |entry| {
+        ranges.add(source.list_type, source.direction, entry)
+    })
+}
+
+fn fetch_source(
+    client: &Client,
+    source: &crate::source::SourceConfig,
+    ranges: &mut RangeAccumulators,
+) -> Result<usize, Box<dyn std::error::Error>> {
+    source.fetch_and_visit(client, |entry| {
+        ranges.add(source.list_type, source.direction, entry)
+    })
+}
+
 /// Retrieve, route, and merge all enabled sources.
 pub fn retrieve_blocklists(
     client: &Client,
     config: &Config,
 ) -> Result<RetrievedBlocklists, Box<dyn std::error::Error>> {
-    let mut inbound_blocklist = IpRanges::new();
-    let mut outbound_blocklist = IpRanges::new();
-    let mut inbound_allowlist = IpRanges::new();
-    let mut outbound_allowlist = IpRanges::new();
+    let mut ranges = RangeAccumulators::default();
     let mut total_entries = 0;
     let mut inbound_entries = 0;
     let mut outbound_entries = 0;
@@ -86,41 +145,21 @@ pub fn retrieve_blocklists(
         if source.rate_limited {
             println!("  Note: This source is rate limited. Please be respectful.");
         }
-        match source.fetch_list(client) {
-            Ok(entries) => {
-                successful_sources.push(source.name.clone());
-                for entry in entries {
-                    total_entries += 1;
-                    match (source.list_type, source.direction) {
-                        (ListType::Blocklist, Direction::Inbound) => {
-                            inbound_blocklist.add(entry);
-                            inbound_entries += 1;
-                        }
-                        (ListType::Blocklist, Direction::Outbound) => {
-                            outbound_blocklist.add(entry);
-                            outbound_entries += 1;
-                        }
-                        (ListType::Blocklist, Direction::Both) => {
-                            inbound_blocklist.add(entry);
-                            outbound_blocklist.add(entry);
-                            inbound_entries += 1;
-                            outbound_entries += 1;
-                        }
-                        (ListType::Allowlist, Direction::Inbound) => {
-                            inbound_allowlist.add(entry);
-                            allowlist_entries += 1;
-                        }
-                        (ListType::Allowlist, Direction::Outbound) => {
-                            outbound_allowlist.add(entry);
-                            allowlist_entries += 1;
-                        }
-                        (ListType::Allowlist, Direction::Both) => {
-                            inbound_allowlist.add(entry);
-                            outbound_allowlist.add(entry);
-                            allowlist_entries += 1;
-                        }
-                    }
+        match source.fetch_and_visit(client, |entry| {
+            total_entries += 1;
+            match (source.list_type, source.direction) {
+                (ListType::Blocklist, Direction::Inbound) => inbound_entries += 1,
+                (ListType::Blocklist, Direction::Outbound) => outbound_entries += 1,
+                (ListType::Blocklist, Direction::Both) => {
+                    inbound_entries += 1;
+                    outbound_entries += 1;
                 }
+                (ListType::Allowlist, _) => allowlist_entries += 1,
+            }
+            ranges.add(source.list_type, source.direction, entry);
+        }) {
+            Ok(_) => {
+                successful_sources.push(source.name.clone());
             }
             Err(error) => eprintln!("  Error fetching {}: {}", source.name, error),
         }
@@ -146,8 +185,8 @@ pub fn retrieve_blocklists(
                 total_entries += inbound.len() + outbound.len();
                 inbound_entries += inbound.len();
                 outbound_entries += outbound.len();
-                inbound_blocklist.add_all(inbound);
-                outbound_blocklist.add_all(outbound);
+                ranges.inbound_blocklist.append(inbound);
+                ranges.outbound_blocklist.append(outbound);
                 successful_sources.push(geoip.name.clone());
             }
             Err(error) => eprintln!("  Error fetching GeoIP source '{}': {error}", geoip.name),
@@ -159,30 +198,26 @@ pub fn retrieve_blocklists(
     println!("Inbound entries processed: {}", inbound_entries);
     println!("Outbound entries processed: {}", outbound_entries);
     println!("Allowlist entries processed: {}", allowlist_entries);
+    let blocklists = ranges.finalize();
     println!(
         "Inbound unique IPv4 networks: {}",
-        inbound_blocklist.ipv4_count()
+        blocklists.inbound.ipv4_networks().count()
     );
     println!(
         "Inbound unique IPv6 networks: {}",
-        inbound_blocklist.ipv6_count()
+        blocklists.inbound.ipv6_networks().count()
     );
     println!(
         "Outbound unique IPv4 networks: {}",
-        outbound_blocklist.ipv4_count()
+        blocklists.outbound.ipv4_networks().count()
     );
     println!(
         "Outbound unique IPv6 networks: {}",
-        outbound_blocklist.ipv6_count()
+        blocklists.outbound.ipv6_networks().count()
     );
 
-    inbound_allowlist.simplify();
-    outbound_allowlist.simplify();
     Ok(RetrievedBlocklists {
-        blocklists: DirectionalBlocklists {
-            inbound: finalize(inbound_blocklist, Some(&inbound_allowlist)),
-            outbound: finalize(outbound_blocklist, Some(&outbound_allowlist)),
-        },
+        blocklists,
         successful_sources,
         source_outcomes: Vec::new(),
     })
@@ -196,36 +231,30 @@ pub fn retrieve_blocklists_with_resilience(
 ) -> Result<RetrievedBlocklists, Box<dyn std::error::Error>> {
     prune_inactive_sources(config, context);
 
-    let mut inbound_blocklist = IpRanges::new();
-    let mut outbound_blocklist = IpRanges::new();
-    let mut inbound_allowlist = IpRanges::new();
-    let mut outbound_allowlist = IpRanges::new();
+    let mut ranges = RangeAccumulators::default();
     let mut successful_sources = Vec::new();
     let mut source_outcomes = Vec::new();
 
     for source in config.sources().filter(|source| source.enabled) {
         println!("Processing '{}'...", source.name);
-        let entries = if source.net_list.is_some() {
-            let entries = source.fetch_list(client)?;
+        if source.net_list.is_some() {
+            fetch_source(client, source, &mut ranges)?;
             source_outcomes.push(SourceRefreshOutcome::Inline {
                 name: source.name.clone(),
             });
-            Some(entries)
         } else if !context.policy.enabled {
-            match source.fetch_list(client) {
-                Ok(entries) => {
+            match fetch_source(client, source, &mut ranges) {
+                Ok(_) => {
                     successful_sources.push(source.name.clone());
                     source_outcomes.push(SourceRefreshOutcome::Fresh {
                         name: source.name.clone(),
                     });
-                    Some(entries)
                 }
                 Err(error) => {
                     eprintln!("  Error fetching {}: {}", source.name, error);
                     source_outcomes.push(SourceRefreshOutcome::Unavailable {
                         name: source.name.clone(),
                     });
-                    None
                 }
             }
         } else {
@@ -237,13 +266,12 @@ pub fn retrieve_blocklists_with_resilience(
                         Utc::now().to_rfc3339(),
                         cached_source,
                     );
-                    let entries = source.parse(&body);
-                    println!("  Found {} entries", entries.len());
+                    let entry_count = parse_source_body(source, &body, &mut ranges);
+                    println!("  Found {entry_count} entries");
                     successful_sources.push(source.name.clone());
                     source_outcomes.push(SourceRefreshOutcome::Fresh {
                         name: source.name.clone(),
                     });
-                    Some(entries)
                 }
                 Err(error) => {
                     eprintln!("  Error fetching {}: {}", source.name, error);
@@ -253,16 +281,15 @@ pub fn retrieve_blocklists_with_resilience(
                     let cache_dir = context.cache_dir.clone();
                     match read_eligible_cached_body(&cache_dir, &source.name, failures, context) {
                         Ok(Some(body)) => {
-                            let entries = source.parse(&body);
+                            let entry_count = parse_source_body(source, &body, &mut ranges);
                             println!(
                                 "  Using cached source after {failures} failure(s); found {} entries",
-                                entries.len()
+                                entry_count
                             );
                             source_outcomes.push(SourceRefreshOutcome::Stale {
                                 name: source.name.clone(),
                                 failures,
                             });
-                            Some(entries)
                         }
                         Ok(None) => {
                             eprintln!(
@@ -273,7 +300,6 @@ pub fn retrieve_blocklists_with_resilience(
                                 name: source.name.clone(),
                                 failures,
                             });
-                            None
                         }
                         Err(cache_error) => {
                             eprintln!(
@@ -283,27 +309,7 @@ pub fn retrieve_blocklists_with_resilience(
                             source_outcomes.push(SourceRefreshOutcome::Unavailable {
                                 name: source.name.clone(),
                             });
-                            None
                         }
-                    }
-                }
-            }
-        };
-
-        if let Some(entries) = entries {
-            for entry in entries {
-                match (source.list_type, source.direction) {
-                    (ListType::Blocklist, Direction::Inbound) => inbound_blocklist.add(entry),
-                    (ListType::Blocklist, Direction::Outbound) => outbound_blocklist.add(entry),
-                    (ListType::Blocklist, Direction::Both) => {
-                        inbound_blocklist.add(entry);
-                        outbound_blocklist.add(entry);
-                    }
-                    (ListType::Allowlist, Direction::Inbound) => inbound_allowlist.add(entry),
-                    (ListType::Allowlist, Direction::Outbound) => outbound_allowlist.add(entry),
-                    (ListType::Allowlist, Direction::Both) => {
-                        inbound_allowlist.add(entry);
-                        outbound_allowlist.add(entry);
                     }
                 }
             }
@@ -314,19 +320,14 @@ pub fn retrieve_blocklists_with_resilience(
         client,
         config.geoip.as_ref().filter(|geoip| geoip.enabled),
         context,
-        &mut inbound_blocklist,
-        &mut outbound_blocklist,
+        &mut ranges.inbound_blocklist,
+        &mut ranges.outbound_blocklist,
         &mut successful_sources,
         &mut source_outcomes,
     );
 
-    inbound_allowlist.simplify();
-    outbound_allowlist.simplify();
     Ok(RetrievedBlocklists {
-        blocklists: DirectionalBlocklists {
-            inbound: finalize(inbound_blocklist, Some(&inbound_allowlist)),
-            outbound: finalize(outbound_blocklist, Some(&outbound_allowlist)),
-        },
+        blocklists: ranges.finalize(),
         successful_sources,
         source_outcomes,
     })
@@ -336,8 +337,8 @@ fn add_geoip_with_resilience(
     client: &Client,
     geoip: Option<&GeoIpConfig>,
     context: &mut RefreshContext,
-    inbound: &mut IpRanges,
-    outbound: &mut IpRanges,
+    inbound: &mut IpRangeAccumulator,
+    outbound: &mut IpRangeAccumulator,
     successful_sources: &mut Vec<String>,
     outcomes: &mut Vec<SourceRefreshOutcome>,
 ) {
@@ -461,8 +462,8 @@ fn add_geoip_with_resilience(
             geoip_inbound.len(),
             geoip_outbound.len()
         );
-        inbound.add_all(geoip_inbound);
-        outbound.add_all(geoip_outbound);
+        inbound.append(geoip_inbound);
+        outbound.append(geoip_outbound);
     }
 }
 
@@ -768,10 +769,16 @@ mod tests {
             .blocklists;
 
         assert_eq!(
-            result.inbound.final_ipv4(),
+            result.inbound.ipv4_networks().collect::<Vec<_>>(),
             vec!["192.0.2.128/25".parse().unwrap()]
         );
-        assert!(result.outbound.final_ipv4().is_empty());
+        assert!(
+            result
+                .outbound
+                .ipv4_networks()
+                .collect::<Vec<_>>()
+                .is_empty()
+        );
         response.assert();
     }
 
@@ -809,7 +816,11 @@ mod tests {
         let retrieved =
             retrieve_blocklists_with_resilience(&Client::new(), &config, &mut context).unwrap();
         assert_eq!(
-            retrieved.blocklists.inbound.final_ipv4(),
+            retrieved
+                .blocklists
+                .inbound
+                .ipv4_networks()
+                .collect::<Vec<_>>(),
             vec!["192.0.2.0/24".parse().unwrap()]
         );
         assert_eq!(
@@ -849,7 +860,11 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            retrieved.blocklists.inbound.final_ipv4(),
+            retrieved
+                .blocklists
+                .inbound
+                .ipv4_networks()
+                .collect::<Vec<_>>(),
             vec!["192.0.2.0/24".parse().unwrap()]
         );
         assert_eq!(
@@ -891,7 +906,14 @@ mod tests {
         )
         .unwrap();
 
-        assert!(retrieved.blocklists.inbound.final_ipv4().is_empty());
+        assert!(
+            retrieved
+                .blocklists
+                .inbound
+                .ipv4_networks()
+                .collect::<Vec<_>>()
+                .is_empty()
+        );
         assert_eq!(
             retrieved.source_outcomes,
             vec![SourceRefreshOutcome::Expired {
@@ -1062,11 +1084,11 @@ mod tests {
             .blocklists;
 
         assert_eq!(
-            blocklists.inbound.final_ipv4(),
+            blocklists.inbound.ipv4_networks().collect::<Vec<_>>(),
             vec!["192.0.2.128/25".parse().unwrap()]
         );
         assert_eq!(
-            blocklists.outbound.final_ipv4(),
+            blocklists.outbound.ipv4_networks().collect::<Vec<_>>(),
             vec![
                 "192.0.2.0/24".parse().unwrap(),
                 "198.51.100.0/24".parse().unwrap(),
@@ -1097,7 +1119,13 @@ mod tests {
             .unwrap()
             .blocklists;
 
-        assert!(blocklists.inbound.final_ipv4().is_empty());
+        assert!(
+            blocklists
+                .inbound
+                .ipv4_networks()
+                .collect::<Vec<_>>()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -1136,10 +1164,28 @@ mod tests {
             "2001:db8::/32".parse().unwrap(),
             "2001:4860:4860::8888/128".parse().unwrap(),
         ];
-        assert_eq!(result.inbound.final_ipv4(), expected_v4);
-        assert_eq!(result.inbound.final_ipv6(), expected_v6);
-        assert!(result.outbound.final_ipv4().is_empty());
-        assert!(result.outbound.final_ipv6().is_empty());
+        assert_eq!(
+            result.inbound.ipv4_networks().collect::<Vec<_>>(),
+            expected_v4
+        );
+        assert_eq!(
+            result.inbound.ipv6_networks().collect::<Vec<_>>(),
+            expected_v6
+        );
+        assert!(
+            result
+                .outbound
+                .ipv4_networks()
+                .collect::<Vec<_>>()
+                .is_empty()
+        );
+        assert!(
+            result
+                .outbound
+                .ipv6_networks()
+                .collect::<Vec<_>>()
+                .is_empty()
+        );
         blocklist_one.assert();
         blocklist_two.assert();
     }
@@ -1168,10 +1214,16 @@ mod tests {
         let result = retrieve_blocklists(&client, &config).unwrap().blocklists;
 
         assert_eq!(
-            result.inbound.final_ipv4(),
+            result.inbound.ipv4_networks().collect::<Vec<_>>(),
             vec!["8.8.8.0/24".parse().unwrap()]
         );
-        assert!(result.inbound.final_ipv6().is_empty());
+        assert!(
+            result
+                .inbound
+                .ipv6_networks()
+                .collect::<Vec<_>>()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -1192,10 +1244,34 @@ mod tests {
 
         let result = retrieve_blocklists(&client, &config).unwrap().blocklists;
 
-        assert!(result.inbound.final_ipv4().is_empty());
-        assert!(result.inbound.final_ipv6().is_empty());
-        assert!(result.outbound.final_ipv4().is_empty());
-        assert!(result.outbound.final_ipv6().is_empty());
+        assert!(
+            result
+                .inbound
+                .ipv4_networks()
+                .collect::<Vec<_>>()
+                .is_empty()
+        );
+        assert!(
+            result
+                .inbound
+                .ipv6_networks()
+                .collect::<Vec<_>>()
+                .is_empty()
+        );
+        assert!(
+            result
+                .outbound
+                .ipv4_networks()
+                .collect::<Vec<_>>()
+                .is_empty()
+        );
+        assert!(
+            result
+                .outbound
+                .ipv6_networks()
+                .collect::<Vec<_>>()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -1225,12 +1301,37 @@ mod tests {
         let result = retrieve_blocklists(&client, &config).unwrap();
 
         assert_eq!(
-            result.blocklists.inbound.final_ipv4(),
+            result
+                .blocklists
+                .inbound
+                .ipv4_networks()
+                .collect::<Vec<_>>(),
             vec!["9.9.9.0/24".parse().unwrap()]
         );
-        assert!(result.blocklists.inbound.final_ipv6().is_empty());
-        assert!(result.blocklists.outbound.final_ipv4().is_empty());
-        assert!(result.blocklists.outbound.final_ipv6().is_empty());
+        assert!(
+            result
+                .blocklists
+                .inbound
+                .ipv6_networks()
+                .collect::<Vec<_>>()
+                .is_empty()
+        );
+        assert!(
+            result
+                .blocklists
+                .outbound
+                .ipv4_networks()
+                .collect::<Vec<_>>()
+                .is_empty()
+        );
+        assert!(
+            result
+                .blocklists
+                .outbound
+                .ipv6_networks()
+                .collect::<Vec<_>>()
+                .is_empty()
+        );
         assert_eq!(
             result.successful_sources,
             vec![format!("{}/successful.txt", server.url())]
@@ -1266,12 +1367,30 @@ mod tests {
         let result = retrieve_blocklists(&client, &config).unwrap().blocklists;
 
         assert_eq!(
-            result.inbound.final_ipv4(),
+            result.inbound.ipv4_networks().collect::<Vec<_>>(),
             vec!["8.8.8.0/24".parse().unwrap()]
         );
-        assert!(result.inbound.final_ipv6().is_empty());
-        assert!(result.outbound.final_ipv4().is_empty());
-        assert!(result.outbound.final_ipv6().is_empty());
+        assert!(
+            result
+                .inbound
+                .ipv6_networks()
+                .collect::<Vec<_>>()
+                .is_empty()
+        );
+        assert!(
+            result
+                .outbound
+                .ipv4_networks()
+                .collect::<Vec<_>>()
+                .is_empty()
+        );
+        assert!(
+            result
+                .outbound
+                .ipv6_networks()
+                .collect::<Vec<_>>()
+                .is_empty()
+        );
         blocklist.assert();
     }
 
@@ -1306,15 +1425,27 @@ mod tests {
         let result = retrieve_blocklists(&client, &config).unwrap().blocklists;
 
         assert_eq!(
-            result.inbound.final_ipv4(),
+            result.inbound.ipv4_networks().collect::<Vec<_>>(),
             vec!["8.8.8.0/24".parse().unwrap()]
         );
-        assert!(result.inbound.final_ipv6().is_empty());
+        assert!(
+            result
+                .inbound
+                .ipv6_networks()
+                .collect::<Vec<_>>()
+                .is_empty()
+        );
         assert_eq!(
-            result.outbound.final_ipv4(),
+            result.outbound.ipv4_networks().collect::<Vec<_>>(),
             vec!["9.9.9.0/24".parse().unwrap()]
         );
-        assert!(result.outbound.final_ipv6().is_empty());
+        assert!(
+            result
+                .outbound
+                .ipv6_networks()
+                .collect::<Vec<_>>()
+                .is_empty()
+        );
         inbound_blocklist.assert();
         outbound_blocklist.assert();
     }
@@ -1344,15 +1475,27 @@ mod tests {
         let result = retrieve_blocklists(&client, &config).unwrap().blocklists;
 
         assert_eq!(
-            result.inbound.final_ipv4(),
+            result.inbound.ipv4_networks().collect::<Vec<_>>(),
             vec!["4.4.4.0/24".parse().unwrap()]
         );
-        assert!(result.inbound.final_ipv6().is_empty());
+        assert!(
+            result
+                .inbound
+                .ipv6_networks()
+                .collect::<Vec<_>>()
+                .is_empty()
+        );
         assert_eq!(
-            result.outbound.final_ipv4(),
+            result.outbound.ipv4_networks().collect::<Vec<_>>(),
             vec!["4.4.4.0/24".parse().unwrap()]
         );
-        assert!(result.outbound.final_ipv6().is_empty());
+        assert!(
+            result
+                .outbound
+                .ipv6_networks()
+                .collect::<Vec<_>>()
+                .is_empty()
+        );
         both_blocklist.assert();
     }
 
@@ -1395,11 +1538,11 @@ mod tests {
         let result = retrieve_blocklists(&client, &config).unwrap().blocklists;
 
         assert_eq!(
-            result.inbound.final_ipv4(),
+            result.inbound.ipv4_networks().collect::<Vec<_>>(),
             vec!["8.8.8.128/25".parse().unwrap()]
         );
         assert_eq!(
-            result.outbound.final_ipv4(),
+            result.outbound.ipv4_networks().collect::<Vec<_>>(),
             vec!["8.8.8.0/24".parse().unwrap()]
         );
         inbound_blocklist.assert();
@@ -1440,8 +1583,11 @@ mod tests {
         let result = retrieve_blocklists(&client, &config).unwrap().blocklists;
 
         let expected: Vec<Ipv4Net> = vec!["4.4.4.128/25".parse().unwrap()];
-        assert_eq!(result.inbound.final_ipv4(), expected);
-        assert_eq!(result.outbound.final_ipv4(), expected);
+        assert_eq!(result.inbound.ipv4_networks().collect::<Vec<_>>(), expected);
+        assert_eq!(
+            result.outbound.ipv4_networks().collect::<Vec<_>>(),
+            expected
+        );
         blocklist.assert();
         allowlist.assert();
     }
