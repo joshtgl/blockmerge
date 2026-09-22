@@ -9,7 +9,7 @@ COPY src ./src
 
 RUN cargo build --locked --release --bin blockmerge --bin blockmerge-web
 
-FROM debian:13.6-slim AS runtime-base
+FROM debian:13.7-slim AS runtime-base
 
 ARG BLOCKMERGE_GID=10001
 ARG BLOCKMERGE_UID=10001
