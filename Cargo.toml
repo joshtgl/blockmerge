@@ -13,7 +13,7 @@ chrono = { version = "0.4.45", features = ["serde"] }
 clap = { version = "4.6.7", features = ["derive", "env"] }
 csv = "1.4.0"
 etcetera = "0.11"
-globset = "0.4.20"
+globset = "0.4.21"
 hex = "0.4.3"
 http = "1.5.0"
 ipnet = "2.12.2"
@@ -24,7 +24,7 @@ serde_json = "1.0.154"
 static-web-server = { version = "2.44.1", default-features = false, features = ["directory-listing"] }
 sha2 = "0.11.1"
 tempfile = "3.27.0"
-tokio = { version = "1.53.3", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
+tokio = { version = "1.54.1", features = ["macros", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-cron-scheduler = "0.15.1"
 toml = "1.1.8"
 zip = { version = "8.6.0", default-features = false, features = ["deflate"] }
