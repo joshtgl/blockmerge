@@ -346,7 +346,7 @@ fn read_zip_csv(body: &[u8]) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
         .find(|index| {
             archive
                 .by_index(*index)
-                .is_ok_and(|file| file.name().ends_with(".csv"))
+                .is_ok_and(|file| file.name().is_ok_and(|name| name.ends_with(".csv")))
         })
         .ok_or("GeoIP ZIP does not contain a CSV file")?;
     let mut csv_file = archive.by_index(csv_index)?;
