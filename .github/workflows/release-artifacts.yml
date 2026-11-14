@@ -57,7 +57,7 @@ jobs:
 
       - name: Install release tooling
         run: |
-          cargo install cargo-zigbuild --version 0.23.0 --locked
+          cargo install cargo-zigbuild --version 0.24.0 --locked
           cargo install cargo-cyclonedx --version 0.5.9 --locked
 
       - name: Build static binaries
