@@ -1,0 +1,6 @@
+[advisories]
+ignore = [
+  # h2 0.3 is pulled in by static-web-server 2.x through hyper 0.14 and has no
+  # patched release. Remove once static-web-server 3.0 (hyper 1) is adopted.
+  { id = "RUSTSEC-2026-0258", reason = "no fixed h2 0.3 release; waiting on static-web-server 3.0" },
+]
