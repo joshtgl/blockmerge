@@ -7,7 +7,9 @@
     "dependencies"
   ],
   "rangeStrategy": "bump",
-  "dependencyDashboard": true,
+  "dependencyDashboard": {
+    "enabled": true
+  },
   "prConcurrentLimit": 5,
   "nix": {
     "enabled": true
