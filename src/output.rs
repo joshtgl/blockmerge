@@ -282,23 +282,25 @@ fn existing_output_matches(
     }
 
     let mut payload_offset = 0;
-    if !has_timestamp_header
-        && !compare_chunk(
-            &prefix[..prefix_length],
-            payload.as_bytes(),
-            &mut payload_offset,
-        )
-    {
-        return Ok(false);
+    if !has_timestamp_header {
+        let Some(chunk) = prefix.get(..prefix_length) else {
+            return Ok(false);
+        };
+        if !compare_chunk(chunk, payload.as_bytes(), &mut payload_offset) {
+            return Ok(false);
+        }
     }
 
     let mut buffer = [0; COMPARISON_BUFFER_SIZE];
     loop {
         let read = reader.read(&mut buffer)?;
-        if read == 0 {
+        let Some(chunk) = buffer.get(..read) else {
+            return Ok(false);
+        };
+        if chunk.is_empty() {
             return Ok(payload_offset == payload.len());
         }
-        if !compare_chunk(&buffer[..read], payload.as_bytes(), &mut payload_offset) {
+        if !compare_chunk(chunk, payload.as_bytes(), &mut payload_offset) {
             return Ok(false);
         }
     }
@@ -306,8 +308,11 @@ fn existing_output_matches(
 
 fn read_prefix(reader: &mut BufReader<File>, prefix: &mut [u8]) -> std::io::Result<usize> {
     let mut prefix_length = 0;
-    while prefix_length < prefix.len() {
-        let read = reader.read(&mut prefix[prefix_length..])?;
+    while let Some(remaining) = prefix.get_mut(prefix_length..) {
+        if remaining.is_empty() {
+            break;
+        }
+        let read = reader.read(remaining)?;
         if read == 0 {
             break;
         }

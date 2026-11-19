@@ -31,3 +31,17 @@ zip = { version = "9.5.1", default-features = false, features = ["deflate"] }
 
 [dev-dependencies]
 mockito = "1.7.2"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+# Runtime code must return errors instead of panicking. Tests are exempt via clippy.toml.
+expect_used = "deny"
+indexing_slicing = "deny"
+panic = "deny"
+panic_in_result_fn = "deny"
+todo = "deny"
+unimplemented = "deny"
+unreachable = "deny"
+unwrap_used = "deny"

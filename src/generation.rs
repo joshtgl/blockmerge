@@ -883,10 +883,11 @@ fn sha256_file(path: &Path) -> Result<String, std::io::Error> {
     let mut buffer = [0_u8; 64 * 1024];
     loop {
         let read = file.read(&mut buffer)?;
-        if read == 0 {
-            break;
+        match buffer.get(..read) {
+            Some([]) => break,
+            Some(chunk) => hasher.update(chunk),
+            None => return Err(std::io::Error::other("read past end of buffer")),
         }
-        hasher.update(&buffer[..read]);
     }
     Ok(hex::encode(hasher.finalize()))
 }

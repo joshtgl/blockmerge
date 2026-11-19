@@ -321,10 +321,10 @@ impl SourceConfig {
     where
         F: FnMut(&Value),
     {
-        if path_segments.is_empty() {
+        let Some((segment, rest)) = path_segments.split_first() else {
             visit(value);
             return;
-        }
+        };
         match value {
             Value::Array(items) => {
                 for item in items {
@@ -332,8 +332,8 @@ impl SourceConfig {
                 }
             }
             Value::Object(map) => {
-                if let Some(next) = map.get(path_segments[0]) {
-                    self.visit_json_path_values(next, &path_segments[1..], visit);
+                if let Some(next) = map.get(*segment) {
+                    self.visit_json_path_values(next, rest, visit);
                 }
             }
             _ => {}
