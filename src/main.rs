@@ -3,10 +3,13 @@ use std::sync::Arc;
 
 use blockmerge::{
     config::load_config,
-    generation::RefreshContext,
-    output::{generate_blocklist_outputs_with_resilience, write_generated_outputs_if_changed},
+    generation::{GeneratedBlocklistOutputs, RefreshContext},
+    output::{
+        OutputWriteResult, generate_blocklist_outputs_with_resilience,
+        write_generated_outputs_if_changed,
+    },
     schedule::{register_schedule, validate_runtime_config},
-    state::{load_state, save_state},
+    state::{StateFile, load_state, save_state},
     storage::resolve_storage_paths,
 };
 use clap::Parser;
@@ -73,13 +76,14 @@ fn run_once(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     let client = build_client()?;
 
     let outputs = generate_blocklist_outputs_with_resilience(&client, &config, &mut refresh)?;
-    save_state(&storage.state_file, &refresh.state)?;
     let written = write_generated_outputs_if_changed(
         &args.inbound_output,
         &args.outbound_output,
         &outputs,
         config.output.timestamp_header,
     )?;
+    record_generation(&mut refresh.state, &outputs, &written);
+    save_state(&storage.state_file, &refresh.state)?;
     print_refresh_result(&outputs, written.inbound_updated, written.outbound_updated);
     println!("State saved to {}", storage.state_file.display());
     Ok(())
@@ -168,15 +172,30 @@ async fn run_refresh(
     let outputs = tokio::task::block_in_place(|| {
         generate_blocklist_outputs_with_resilience(client, config, &mut refresh_context)
     })?;
-    save_state(state_file, &refresh_context.state)?;
     let written = write_generated_outputs_if_changed(
         inbound_output,
         outbound_output,
         &outputs,
         config.output.timestamp_header,
     )?;
+    record_generation(&mut refresh_context.state, &outputs, &written);
+    save_state(state_file, &refresh_context.state)?;
     print_refresh_result(&outputs, written.inbound_updated, written.outbound_updated);
     Ok(())
+}
+
+fn record_generation(
+    state: &mut StateFile,
+    outputs: &GeneratedBlocklistOutputs,
+    written: &OutputWriteResult,
+) {
+    state.record_generation(
+        chrono::Utc::now().to_rfc3339(),
+        outputs.inbound_entries,
+        outputs.outbound_entries,
+        written.inbound_updated,
+        written.outbound_updated,
+    );
 }
 
 fn print_refresh_result(
