@@ -5,7 +5,7 @@ use std::io::{Cursor, Read};
 use std::time::Duration;
 
 use ipnet::IpNet;
-use reqwest::{Url, blocking::Client};
+use reqwest::{Client, Url};
 use serde::Deserialize;
 use zip::ZipArchive;
 
@@ -239,7 +239,10 @@ impl GeoIpConfig {
     }
 
     /// Download the configured database without logging its credential-bearing URL.
-    pub fn fetch_database(&self, client: &Client) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    pub async fn fetch_database(
+        &self,
+        client: &Client,
+    ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
         let url = self.database_request_url()?;
         println!(
             "  Fetching {:?} country database for '{}'...",
@@ -248,12 +251,14 @@ impl GeoIpConfig {
         let response = client
             .get(url)
             .send()
+            .await
             .map_err(|_| "failed to request GeoIP country database")?;
         if !response.status().is_success() {
             return Err(format!("GeoIP service returned HTTP {}", response.status()).into());
         }
         Ok(response
             .bytes()
+            .await
             .map_err(|_| "failed to read GeoIP country database")?
             .to_vec())
     }

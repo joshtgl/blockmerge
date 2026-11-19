@@ -3,7 +3,7 @@
 use std::net::IpAddr;
 
 use ipnet::{IpNet, Ipv4Net, Ipv6Net};
-use reqwest::blocking::Client;
+use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -351,7 +351,7 @@ impl SourceConfig {
         }
     }
 
-    pub(crate) fn fetch_and_visit<F>(
+    pub(crate) async fn fetch_and_visit<F>(
         &self,
         client: &Client,
         mut visit: F,
@@ -364,7 +364,7 @@ impl SourceConfig {
             println!("  Found {entry_count} inline entries");
             Ok(entry_count)
         } else {
-            let body = self.fetch_body(client)?;
+            let body = self.fetch_body(client).await?;
             let entry_count = self.visit_entries(&body, &mut visit);
             println!("  Found {entry_count} entries");
             Ok(entry_count)
@@ -402,12 +402,15 @@ impl SourceConfig {
     }
 
     /// Download an unparsed source body for resilient caching.
-    pub(crate) fn fetch_body(&self, client: &Client) -> Result<String, Box<dyn std::error::Error>> {
+    pub(crate) async fn fetch_body(
+        &self,
+        client: &Client,
+    ) -> Result<String, Box<dyn std::error::Error>> {
         let Some(url) = self.url.as_deref() else {
             return Err("source is missing url".into());
         };
         println!("  Fetching from {}...", url);
-        let response = client.get(url).send()?;
+        let response = client.get(url).send().await?;
         if !response.status().is_success() {
             return Err(format!(
                 "HTTP {}: {}",
@@ -419,7 +422,7 @@ impl SourceConfig {
             )
             .into());
         }
-        Ok(response.text()?)
+        Ok(response.text().await?)
     }
 }
 
@@ -499,14 +502,15 @@ mod tests {
         );
     }
 
-    #[test]
-    fn parses_inline_sources_without_a_url() {
+    #[tokio::test]
+    async fn parses_inline_sources_without_a_url() {
         let mut source = source();
         source.net_list = Some(vec!["10.0.0.0/8".to_string(), "2001:db8::/32".to_string()]);
 
         let mut entries = Vec::new();
         source
             .fetch_and_visit(&Client::new(), |entry| entries.push(entry))
+            .await
             .unwrap();
         assert_eq!(
             entries,
@@ -1187,8 +1191,8 @@ mod tests {
         assert_eq!(result, vec![net("8.8.8.0/24")]);
     }
 
-    #[test]
-    fn test_fetch_list_uses_inline_net_list_without_url() {
+    #[tokio::test]
+    async fn test_fetch_list_uses_inline_net_list_without_url() {
         let source = SourceConfig {
             name: "test".to_string(),
             url: None,
@@ -1208,6 +1212,7 @@ mod tests {
         let mut result = Vec::new();
         source
             .fetch_and_visit(&client, |entry| result.push(entry))
+            .await
             .unwrap();
 
         assert_eq!(result, vec![net("10.0.0.0/8"), net("2001:db8::/32")]);

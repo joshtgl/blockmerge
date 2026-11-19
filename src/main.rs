@@ -63,11 +63,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if args.daemon {
         run_daemon(args).await
     } else {
-        run_once(args)
+        run_once(args).await
     }
 }
 
-fn run_once(args: Args) -> Result<(), Box<dyn std::error::Error>> {
+async fn run_once(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     println!("Loading configuration from {}...", args.config);
     let config = load_config(&args.config)?;
     let storage = resolve_storage_paths(args.state_file, args.cache_dir)?;
@@ -75,7 +75,8 @@ fn run_once(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     let mut refresh = RefreshContext::new(config.resilience_policy()?, state, storage.cache_dir);
     let client = build_client()?;
 
-    let outputs = generate_blocklist_outputs_with_resilience(&client, &config, &mut refresh)?;
+    let outputs =
+        generate_blocklist_outputs_with_resilience(&client, &config, &mut refresh).await?;
     let written = write_generated_outputs_if_changed(
         &args.inbound_output,
         &args.outbound_output,
@@ -153,15 +154,15 @@ async fn run_daemon(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn build_client() -> Result<reqwest::blocking::Client, Box<dyn std::error::Error>> {
-    reqwest::blocking::Client::builder()
+fn build_client() -> Result<reqwest::Client, Box<dyn std::error::Error>> {
+    reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
         .build()
         .map_err(Into::into)
 }
 
 async fn run_refresh(
-    client: &reqwest::blocking::Client,
+    client: &reqwest::Client,
     config: &blockmerge::config::Config,
     inbound_output: &std::path::Path,
     outbound_output: &std::path::Path,
@@ -169,9 +170,8 @@ async fn run_refresh(
     state_file: &std::path::Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut refresh_context = refresh_context.lock().await;
-    let outputs = tokio::task::block_in_place(|| {
-        generate_blocklist_outputs_with_resilience(client, config, &mut refresh_context)
-    })?;
+    let outputs =
+        generate_blocklist_outputs_with_resilience(client, config, &mut refresh_context).await?;
     let written = write_generated_outputs_if_changed(
         inbound_output,
         outbound_output,

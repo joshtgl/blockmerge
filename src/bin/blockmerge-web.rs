@@ -63,7 +63,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     logger::init(&settings.general.log_level, settings.general.log_with_ansi)?;
     let server = Server::new(settings)?;
 
-    let client = reqwest::blocking::Client::builder()
+    let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
         .build()?;
 
@@ -115,16 +115,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 async fn run_refresh(
-    client: &reqwest::blocking::Client,
+    client: &reqwest::Client,
     config: &Config,
     root_dir: &Path,
     refresh_context: &Mutex<RefreshContext>,
     state_file: &Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut refresh_context = refresh_context.lock().await;
-    let outputs = tokio::task::block_in_place(|| {
-        generate_blocklist_outputs_with_resilience(client, config, &mut refresh_context)
-    })?;
+    let outputs =
+        generate_blocklist_outputs_with_resilience(client, config, &mut refresh_context).await?;
     save_state(state_file, &refresh_context.state)?;
     let (inbound_path, outbound_path) = web_asset_output_paths(root_dir);
     let written = write_generated_outputs_if_changed(
