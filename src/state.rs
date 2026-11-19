@@ -175,6 +175,15 @@ pub fn save_state(
     fs::create_dir_all(parent)?;
     let mut temporary = NamedTempFile::new_in(parent)?;
     temporary.write_all(content.as_bytes())?;
+    // NamedTempFile creates files as 0600; the state holds nothing secret, so
+    // keep it readable by other users like a normally written file.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        temporary
+            .as_file()
+            .set_permissions(fs::Permissions::from_mode(0o644))?;
+    }
     temporary.persist(path).map_err(|error| error.error)?;
     Ok(())
 }
@@ -318,6 +327,22 @@ mod tests {
         assert_eq!(
             load_state(&path).unwrap().last_generation,
             state.last_generation
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn saved_state_is_world_readable() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("state.json");
+
+        save_state(&path, &StateFile::default()).unwrap();
+
+        assert_eq!(
+            fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o644
         );
     }
 
