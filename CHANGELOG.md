@@ -7,6 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0](https://github.com/joshtgl/blockmerge/compare/v0.1.3...v0.2.0) - 2026-11-19
+
+### Added
+
+- record last generation metadata in state file
+- add Nix flake, package and NixOS module
+
+### Fixed
+
+- make the state file world-readable
+- use the async reqwest client
+- *(deps)* update rust crate static-web-server to 2.44.2 ([#23](https://github.com/joshtgl/blockmerge/pull/23))
+- *(deps)* update rust dependencies ([#19](https://github.com/joshtgl/blockmerge/pull/19))
+- *(deps)* update rustls, rustls-webpki, webpki-root-certs, h2 and libz-sys for security advisories
+- *(geoip)* handle fallible ZipFile::name() in zip v9
+- *(deps)* update rust crate zip to v9
+- *(deps)* update rust dependencies ([#13](https://github.com/joshtgl/blockmerge/pull/13))
+
+### Other
+
+- deny panicking code with clippy
+- *(config)* migrate config renovate.json
+- Merge pull request #22 from joshtgl/renovate/release-plz-0.x
+- Merge pull request #21 from joshtgl/renovate/cargo-zigbuild-0.x
+- *(deps)* update dependency release-plz to 0.4.0
+- *(deps)* update dependency cargo-zigbuild to 0.24.0
+- *(deps)* update github actions
+- *(deps)* update debian docker tag to v13.7 ([#20](https://github.com/joshtgl/blockmerge/pull/20))
+- *(deps)* update alpine docker tag to v3.24.4 ([#17](https://github.com/joshtgl/blockmerge/pull/17))
+- *(deps)* lock file maintenance cargo.lock
+- enable lock file maintenance and advisory checks
+- *(deps)* update github actions ([#12](https://github.com/joshtgl/blockmerge/pull/12))
+- *(deps)* update github actions ([#9](https://github.com/joshtgl/blockmerge/pull/9))
+
 ## [0.1.3](https://github.com/joshtgl/blockmerge/compare/v0.1.2...v0.1.3) - 2026-08-21
 
 ### Added
