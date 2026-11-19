@@ -116,32 +116,24 @@ fn ipv6_last_address(network: Ipv6Net) -> u128 {
 
 fn merge_ipv4_intervals(intervals: &mut Vec<Ipv4Interval>) {
     intervals.sort_unstable_by_key(|range| (range.start, range.end));
-    let mut write = 0;
-    for read in 0..intervals.len() {
-        let next = intervals[read];
-        if write > 0 && next.start <= intervals[write - 1].end.saturating_add(1) {
-            intervals[write - 1].end = intervals[write - 1].end.max(next.end);
-        } else {
-            intervals[write] = next;
-            write += 1;
+    intervals.dedup_by(|next, previous| {
+        let overlaps = next.start <= previous.end.saturating_add(1);
+        if overlaps {
+            previous.end = previous.end.max(next.end);
         }
-    }
-    intervals.truncate(write);
+        overlaps
+    });
 }
 
 fn merge_ipv6_intervals(intervals: &mut Vec<Ipv6Interval>) {
     intervals.sort_unstable_by_key(|range| (range.start, range.end));
-    let mut write = 0;
-    for read in 0..intervals.len() {
-        let next = intervals[read];
-        if write > 0 && next.start <= intervals[write - 1].end.saturating_add(1) {
-            intervals[write - 1].end = intervals[write - 1].end.max(next.end);
-        } else {
-            intervals[write] = next;
-            write += 1;
+    intervals.dedup_by(|next, previous| {
+        let overlaps = next.start <= previous.end.saturating_add(1);
+        if overlaps {
+            previous.end = previous.end.max(next.end);
         }
-    }
-    intervals.truncate(write);
+        overlaps
+    });
 }
 
 fn subtract_ipv4_intervals(
@@ -152,7 +144,10 @@ fn subtract_ipv4_intervals(
     let mut allow_index = 0;
     for block in blocks {
         let mut cursor = Some(block.start);
-        while allow_index < allowlist.len() && allowlist[allow_index].end < block.start {
+        while allowlist
+            .get(allow_index)
+            .is_some_and(|allowed| allowed.end < block.start)
+        {
             allow_index += 1;
         }
         let mut index = allow_index;
@@ -197,7 +192,10 @@ fn subtract_ipv6_intervals(
     let mut allow_index = 0;
     for block in blocks {
         let mut cursor = Some(block.start);
-        while allow_index < allowlist.len() && allowlist[allow_index].end < block.start {
+        while allowlist
+            .get(allow_index)
+            .is_some_and(|allowed| allowed.end < block.start)
+        {
             allow_index += 1;
         }
         let mut index = allow_index;
@@ -264,8 +262,8 @@ impl Iterator for Ipv4CidrIterator<'_> {
         };
         let host_bits = start.trailing_zeros().min(span_bits);
         let prefix = (32 - host_bits) as u8;
-        let network = Ipv4Net::new(Ipv4Addr::from(start), prefix)
-            .expect("aligned IPv4 interval must produce a valid CIDR");
+        // The prefix is always at most 32, so this cannot fail.
+        let network = Ipv4Net::new(Ipv4Addr::from(start), prefix).ok()?;
         if host_bits == 32 || start + ((1_u32 << host_bits) - 1) == range.end {
             self.interval_index += 1;
             self.cursor = self
@@ -309,8 +307,8 @@ impl Iterator for Ipv6CidrIterator<'_> {
         };
         let host_bits = start.trailing_zeros().min(span_bits);
         let prefix = (128 - host_bits) as u8;
-        let network = Ipv6Net::new(Ipv6Addr::from(start), prefix)
-            .expect("aligned IPv6 interval must produce a valid CIDR");
+        // The prefix is always at most 128, so this cannot fail.
+        let network = Ipv6Net::new(Ipv6Addr::from(start), prefix).ok()?;
         if host_bits == 128 || start + ((1_u128 << host_bits) - 1) == range.end {
             self.interval_index += 1;
             self.cursor = self

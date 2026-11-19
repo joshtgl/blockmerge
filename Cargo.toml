@@ -18,7 +18,7 @@ hex = "0.4.3"
 http = "1.5.0"
 ipnet = "2.12.2"
 regex-lite = "0.1.9"
-reqwest = { version = "0.13.5", features = ["blocking", "json"] }
+reqwest = { version = "0.13.5", features = ["json"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 static-web-server = { version = "2.44.2", default-features = false, features = ["directory-listing"] }
@@ -31,3 +31,17 @@ zip = { version = "9.5.1", default-features = false, features = ["deflate"] }
 
 [dev-dependencies]
 mockito = "1.7.2"
+
+[lints.rust]
+unsafe_code = "forbid"
+
+[lints.clippy]
+# Runtime code must return errors instead of panicking. Tests are exempt via clippy.toml.
+expect_used = "deny"
+indexing_slicing = "deny"
+panic = "deny"
+panic_in_result_fn = "deny"
+todo = "deny"
+unimplemented = "deny"
+unreachable = "deny"
+unwrap_used = "deny"

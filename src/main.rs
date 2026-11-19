@@ -3,10 +3,13 @@ use std::sync::Arc;
 
 use blockmerge::{
     config::load_config,
-    generation::RefreshContext,
-    output::{generate_blocklist_outputs_with_resilience, write_generated_outputs_if_changed},
+    generation::{GeneratedBlocklistOutputs, RefreshContext},
+    output::{
+        OutputWriteResult, generate_blocklist_outputs_with_resilience,
+        write_generated_outputs_if_changed,
+    },
     schedule::{register_schedule, validate_runtime_config},
-    state::{load_state, save_state},
+    state::{StateFile, load_state, save_state},
     storage::resolve_storage_paths,
 };
 use clap::Parser;
@@ -60,11 +63,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if args.daemon {
         run_daemon(args).await
     } else {
-        run_once(args)
+        run_once(args).await
     }
 }
 
-fn run_once(args: Args) -> Result<(), Box<dyn std::error::Error>> {
+async fn run_once(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     println!("Loading configuration from {}...", args.config);
     let config = load_config(&args.config)?;
     let storage = resolve_storage_paths(args.state_file, args.cache_dir)?;
@@ -72,14 +75,16 @@ fn run_once(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     let mut refresh = RefreshContext::new(config.resilience_policy()?, state, storage.cache_dir);
     let client = build_client()?;
 
-    let outputs = generate_blocklist_outputs_with_resilience(&client, &config, &mut refresh)?;
-    save_state(&storage.state_file, &refresh.state)?;
+    let outputs =
+        generate_blocklist_outputs_with_resilience(&client, &config, &mut refresh).await?;
     let written = write_generated_outputs_if_changed(
         &args.inbound_output,
         &args.outbound_output,
         &outputs,
         config.output.timestamp_header,
     )?;
+    record_generation(&mut refresh.state, &outputs, &written);
+    save_state(&storage.state_file, &refresh.state)?;
     print_refresh_result(&outputs, written.inbound_updated, written.outbound_updated);
     println!("State saved to {}", storage.state_file.display());
     Ok(())
@@ -149,15 +154,15 @@ async fn run_daemon(args: Args) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-fn build_client() -> Result<reqwest::blocking::Client, Box<dyn std::error::Error>> {
-    reqwest::blocking::Client::builder()
+fn build_client() -> Result<reqwest::Client, Box<dyn std::error::Error>> {
+    reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(30))
         .build()
         .map_err(Into::into)
 }
 
 async fn run_refresh(
-    client: &reqwest::blocking::Client,
+    client: &reqwest::Client,
     config: &blockmerge::config::Config,
     inbound_output: &std::path::Path,
     outbound_output: &std::path::Path,
@@ -165,18 +170,32 @@ async fn run_refresh(
     state_file: &std::path::Path,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut refresh_context = refresh_context.lock().await;
-    let outputs = tokio::task::block_in_place(|| {
-        generate_blocklist_outputs_with_resilience(client, config, &mut refresh_context)
-    })?;
-    save_state(state_file, &refresh_context.state)?;
+    let outputs =
+        generate_blocklist_outputs_with_resilience(client, config, &mut refresh_context).await?;
     let written = write_generated_outputs_if_changed(
         inbound_output,
         outbound_output,
         &outputs,
         config.output.timestamp_header,
     )?;
+    record_generation(&mut refresh_context.state, &outputs, &written);
+    save_state(state_file, &refresh_context.state)?;
     print_refresh_result(&outputs, written.inbound_updated, written.outbound_updated);
     Ok(())
+}
+
+fn record_generation(
+    state: &mut StateFile,
+    outputs: &GeneratedBlocklistOutputs,
+    written: &OutputWriteResult,
+) {
+    state.record_generation(
+        chrono::Utc::now().to_rfc3339(),
+        outputs.inbound_entries,
+        outputs.outbound_entries,
+        written.inbound_updated,
+        written.outbound_updated,
+    );
 }
 
 fn print_refresh_result(

@@ -42,12 +42,26 @@ pub struct BlocklistStatus {
     pub cached_source: Option<CachedSource>,
 }
 
+/// Information about the last successful output generation.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct GenerationStatus {
+    pub generated_at: String,
+    pub inbound_entries: usize,
+    pub outbound_entries: usize,
+    #[serde(default)]
+    pub inbound_changed_at: Option<String>,
+    #[serde(default)]
+    pub outbound_changed_at: Option<String>,
+}
+
 /// State file tracking last update times for each source.
 #[derive(Debug, Default, Serialize, Deserialize)]
 pub struct StateFile {
     pub version: u32,
     #[serde(default)]
     pub sources: HashMap<String, BlocklistStatus>,
+    #[serde(default)]
+    pub last_generation: Option<GenerationStatus>,
 }
 
 impl StateFile {
@@ -76,6 +90,33 @@ impl StateFile {
         status.last_attempt_at = Some(last_attempt_at);
         status.consecutive_failures = status.consecutive_failures.saturating_add(1);
         status.consecutive_failures
+    }
+
+    /// Record a completed generation, keeping previous change times for
+    /// outputs that were not rewritten.
+    pub fn record_generation(
+        &mut self,
+        generated_at: String,
+        inbound_entries: usize,
+        outbound_entries: usize,
+        inbound_updated: bool,
+        outbound_updated: bool,
+    ) {
+        let previous = self.last_generation.take().unwrap_or_default();
+        let changed_at = |updated: bool, previous: Option<String>| {
+            if updated {
+                Some(generated_at.clone())
+            } else {
+                previous
+            }
+        };
+        self.last_generation = Some(GenerationStatus {
+            inbound_changed_at: changed_at(inbound_updated, previous.inbound_changed_at),
+            outbound_changed_at: changed_at(outbound_updated, previous.outbound_changed_at),
+            generated_at,
+            inbound_entries,
+            outbound_entries,
+        });
     }
 
     /// Return current metadata for a source.
@@ -124,11 +165,11 @@ pub fn save_state(
     use std::io::Write;
 
     let path = path.as_ref();
-    let mut state = StateFile {
+    let state = StateFile {
         version: STATE_VERSION,
         sources: state.sources.clone(),
+        last_generation: state.last_generation.clone(),
     };
-    state.version = STATE_VERSION;
     let content = serde_json::to_string_pretty(&state)?;
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
     fs::create_dir_all(parent)?;
@@ -263,6 +304,46 @@ mod tests {
             serde_json::from_str(&serde_json::to_string(&cached).unwrap()).unwrap();
 
         assert_eq!(decoded, cached);
+    }
+
+    #[test]
+    fn saves_and_loads_last_generation() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("state.json");
+        let mut state = StateFile::default();
+        state.record_generation("2026-01-01T00:00:00Z".to_string(), 3, 4, true, true);
+
+        save_state(&path, &state).unwrap();
+
+        assert_eq!(
+            load_state(&path).unwrap().last_generation,
+            state.last_generation
+        );
+    }
+
+    #[test]
+    fn loads_state_without_last_generation() {
+        let state: StateFile = serde_json::from_str(r#"{"version": 1, "sources": {}}"#).unwrap();
+
+        assert_eq!(state.last_generation, None);
+    }
+
+    #[test]
+    fn keeps_change_time_for_unchanged_outputs() {
+        let mut state = StateFile::default();
+        state.record_generation("2026-01-01T00:00:00Z".to_string(), 3, 4, true, true);
+        state.record_generation("2026-01-02T00:00:00Z".to_string(), 5, 4, true, false);
+
+        assert_eq!(
+            state.last_generation,
+            Some(GenerationStatus {
+                generated_at: "2026-01-02T00:00:00Z".to_string(),
+                inbound_entries: 5,
+                outbound_entries: 4,
+                inbound_changed_at: Some("2026-01-02T00:00:00Z".to_string()),
+                outbound_changed_at: Some("2026-01-01T00:00:00Z".to_string()),
+            })
+        );
     }
 
     #[test]

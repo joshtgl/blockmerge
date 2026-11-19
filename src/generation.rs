@@ -7,10 +7,10 @@ use std::path::{Component, Path, PathBuf};
 use chrono::{DateTime, Utc};
 use reqwest::StatusCode;
 use reqwest::Url;
-use reqwest::blocking::{Client, Response};
 use reqwest::header::{
     ETAG, HeaderMap, HeaderName, HeaderValue, IF_MODIFIED_SINCE, IF_NONE_MATCH, LAST_MODIFIED,
 };
+use reqwest::{Client, Response};
 use sha2::{Digest, Sha256};
 use tempfile::NamedTempFile;
 
@@ -53,6 +53,17 @@ pub enum SourceRefreshOutcome {
 enum CachedHttpResponse {
     Modified {
         response: Response,
+        validators: Option<HttpValidators>,
+    },
+    NotModified {
+        body: Vec<u8>,
+        cached_source: CachedSource,
+    },
+}
+
+enum CachedBytesResponse {
+    Modified {
+        body: Vec<u8>,
         validators: Option<HttpValidators>,
     },
     NotModified {
@@ -184,7 +195,7 @@ fn response_validators(
     }
 }
 
-fn send_http_request(
+async fn send_http_request(
     client: &Client,
     source_name: &str,
     url: Url,
@@ -216,7 +227,7 @@ fn send_http_request(
         }
     }
 
-    let response = request.send()?;
+    let response = request.send().await?;
     let validators = response_validators(response.headers(), &resource_key, source_name);
     if response.status() == StatusCode::NOT_MODIFIED {
         if !sent_conditional {
@@ -261,7 +272,7 @@ fn merge_revalidated_validators(
     }
 }
 
-fn fetch_cached_http_response(
+async fn fetch_cached_http_response(
     client: &Client,
     source_name: &str,
     url: Url,
@@ -277,7 +288,8 @@ fn fetch_cached_http_response(
         .flatten()
         .and_then(|cached| cached.http_validators.as_ref());
 
-    match send_http_request(client, source_name, url.clone(), stored_validators)? {
+    let response = send_http_request(client, source_name, url.clone(), stored_validators).await?;
+    match response {
         HttpResponse::Modified {
             response,
             validators,
@@ -293,8 +305,11 @@ fn fetch_cached_http_response(
                 )
                 .into());
             };
-            match read_persistent_cached_body(source_name, context) {
-                Ok(Some(body)) => {
+            match read_persistent_cached_body(source_name, context)
+                .ok()
+                .flatten()
+            {
+                Some(body) => {
                     let stored = cached_source
                         .http_validators
                         .as_ref()
@@ -306,13 +321,14 @@ fn fetch_cached_http_response(
                         cached_source,
                     })
                 }
-                Ok(None) | Err(_) => {
+                None => {
                     eprintln!(
                         "  Cached source '{}' cannot satisfy HTTP 304; retrying unconditionally",
                         source_name
                     );
                     expire_source_cache(&context.cache_dir.clone(), source_name, context);
-                    match send_http_request(client, source_name, url, None)? {
+                    let response = send_http_request(client, source_name, url, None).await?;
+                    match response {
                         HttpResponse::Modified {
                             response,
                             validators,
@@ -332,18 +348,47 @@ fn fetch_cached_http_response(
     }
 }
 
-fn fetch_cached_text_response(
+async fn fetch_cached_bytes_response(
+    client: &Client,
+    source_name: &str,
+    url: Url,
+    conditional_enabled: bool,
+    context: &mut RefreshContext,
+) -> Result<CachedBytesResponse, Box<dyn std::error::Error>> {
+    let response =
+        fetch_cached_http_response(client, source_name, url, conditional_enabled, context).await?;
+    match response {
+        CachedHttpResponse::Modified {
+            response,
+            validators,
+        } => Ok(CachedBytesResponse::Modified {
+            body: response.bytes().await?.into(),
+            validators,
+        }),
+        CachedHttpResponse::NotModified {
+            body,
+            cached_source,
+        } => Ok(CachedBytesResponse::NotModified {
+            body,
+            cached_source,
+        }),
+    }
+}
+
+async fn fetch_cached_text_response(
     client: &Client,
     source_name: &str,
     url: Url,
     context: &mut RefreshContext,
 ) -> Result<CachedTextResponse, Box<dyn std::error::Error>> {
-    match fetch_cached_http_response(client, source_name, url.clone(), true, context)? {
+    let response =
+        fetch_cached_http_response(client, source_name, url.clone(), true, context).await?;
+    match response {
         CachedHttpResponse::Modified {
             response,
             validators,
         } => Ok(CachedTextResponse::Modified {
-            body: response.text()?,
+            body: response.text().await?,
             validators,
         }),
         CachedHttpResponse::NotModified {
@@ -360,12 +405,14 @@ fn fetch_cached_text_response(
                     source_name
                 );
                 expire_source_cache(&context.cache_dir.clone(), source_name, context);
-                match fetch_cached_http_response(client, source_name, url, false, context)? {
+                let response =
+                    fetch_cached_http_response(client, source_name, url, false, context).await?;
+                match response {
                     CachedHttpResponse::Modified {
                         response,
                         validators,
                     } => Ok(CachedTextResponse::Modified {
-                        body: response.text()?,
+                        body: response.text().await?,
                         validators,
                     }),
                     CachedHttpResponse::NotModified { .. } => Err(format!(
@@ -379,18 +426,31 @@ fn fetch_cached_text_response(
     }
 }
 
-fn fetch_source(
+async fn fetch_source(
     client: &Client,
     source: &crate::source::SourceConfig,
     ranges: &mut RangeAccumulators,
 ) -> Result<usize, Box<dyn std::error::Error>> {
-    source.fetch_and_visit(client, |entry| {
-        ranges.add(source.list_type, source.direction, entry)
-    })
+    source
+        .fetch_and_visit(client, |entry| {
+            ranges.add(source.list_type, source.direction, entry)
+        })
+        .await
+}
+
+async fn fetch_source_text(
+    client: &Client,
+    source: &crate::source::SourceConfig,
+    context: &mut RefreshContext,
+) -> Result<CachedTextResponse, Box<dyn std::error::Error>> {
+    let source_url = source.url.as_deref().ok_or("source is missing url")?;
+    println!("  Fetching from {}...", source_url);
+    let url = Url::parse(source_url)?;
+    fetch_cached_text_response(client, &source.name, url, context).await
 }
 
 /// Retrieve, route, and merge all enabled sources.
-pub fn retrieve_blocklists(
+pub async fn retrieve_blocklists(
     client: &Client,
     config: &Config,
 ) -> Result<RetrievedBlocklists, Box<dyn std::error::Error>> {
@@ -412,19 +472,22 @@ pub fn retrieve_blocklists(
         if source.rate_limited {
             println!("  Note: This source is rate limited. Please be respectful.");
         }
-        match source.fetch_and_visit(client, |entry| {
-            total_entries += 1;
-            match (source.list_type, source.direction) {
-                (ListType::Blocklist, Direction::Inbound) => inbound_entries += 1,
-                (ListType::Blocklist, Direction::Outbound) => outbound_entries += 1,
-                (ListType::Blocklist, Direction::Both) => {
-                    inbound_entries += 1;
-                    outbound_entries += 1;
+        let fetched = source
+            .fetch_and_visit(client, |entry| {
+                total_entries += 1;
+                match (source.list_type, source.direction) {
+                    (ListType::Blocklist, Direction::Inbound) => inbound_entries += 1,
+                    (ListType::Blocklist, Direction::Outbound) => outbound_entries += 1,
+                    (ListType::Blocklist, Direction::Both) => {
+                        inbound_entries += 1;
+                        outbound_entries += 1;
+                    }
+                    (ListType::Allowlist, _) => allowlist_entries += 1,
                 }
-                (ListType::Allowlist, _) => allowlist_entries += 1,
-            }
-            ranges.add(source.list_type, source.direction, entry);
-        }) {
+                ranges.add(source.list_type, source.direction, entry);
+            })
+            .await;
+        match fetched {
             Ok(_) => {
                 successful_sources.push(source.name.clone());
             }
@@ -436,6 +499,7 @@ pub fn retrieve_blocklists(
         println!("Processing GeoIP source '{}'...", geoip.name);
         match geoip
             .fetch_database(client)
+            .await
             .and_then(|body| geoip.parse_database(&body))
         {
             Ok(GeoIpEntries {
@@ -491,7 +555,7 @@ pub fn retrieve_blocklists(
 }
 
 /// Retrieve all enabled sources, retaining eligible cached bodies after failures.
-pub fn retrieve_blocklists_with_resilience(
+pub async fn retrieve_blocklists_with_resilience(
     client: &Client,
     config: &Config,
     context: &mut RefreshContext,
@@ -505,12 +569,12 @@ pub fn retrieve_blocklists_with_resilience(
     for source in config.sources().filter(|source| source.enabled) {
         println!("Processing '{}'...", source.name);
         if source.net_list.is_some() {
-            fetch_source(client, source, &mut ranges)?;
+            fetch_source(client, source, &mut ranges).await?;
             source_outcomes.push(SourceRefreshOutcome::Inline {
                 name: source.name.clone(),
             });
         } else if !context.policy.enabled {
-            match fetch_source(client, source, &mut ranges) {
+            match fetch_source(client, source, &mut ranges).await {
                 Ok(_) => {
                     successful_sources.push(source.name.clone());
                     source_outcomes.push(SourceRefreshOutcome::Fresh {
@@ -525,13 +589,7 @@ pub fn retrieve_blocklists_with_resilience(
                 }
             }
         } else {
-            let fetched = (|| {
-                let source_url = source.url.as_deref().ok_or("source is missing url")?;
-                println!("  Fetching from {}...", source_url);
-                let url = Url::parse(source_url)?;
-                fetch_cached_text_response(client, &source.name, url, context)
-            })();
-            match fetched {
+            match fetch_source_text(client, source, context).await {
                 Ok(CachedTextResponse::Modified { body, validators }) => {
                     let cached_source = retain_or_write_cached_bytes(
                         &context.cache_dir,
@@ -619,7 +677,8 @@ pub fn retrieve_blocklists_with_resilience(
         &mut ranges.outbound_blocklist,
         &mut successful_sources,
         &mut source_outcomes,
-    );
+    )
+    .await;
 
     Ok(RetrievedBlocklists {
         blocklists: ranges.finalize(),
@@ -628,7 +687,7 @@ pub fn retrieve_blocklists_with_resilience(
     })
 }
 
-fn add_geoip_with_resilience(
+async fn add_geoip_with_resilience(
     client: &Client,
     geoip: Option<&GeoIpConfig>,
     context: &mut RefreshContext,
@@ -641,49 +700,24 @@ fn add_geoip_with_resilience(
         return;
     };
     println!("Processing GeoIP source '{}'...", geoip.name);
-    let entries = match geoip_refresh_due(geoip, context) {
+    // Box<dyn Error> is not Send, so it must not be held across the refresh await.
+    let refresh_due = geoip_refresh_due(geoip, context).map_err(|error| error.to_string());
+    let entries = match refresh_due {
         Ok(true) => {
             println!(
                 "  Fetching {:?} country database for '{}'...",
                 geoip.service, geoip.name
             );
-            let refreshed = geoip.database_request_url().and_then(|url| {
-                fetch_cached_http_response(
-                    client,
-                    &geoip.name,
-                    url,
-                    context.policy.enabled,
-                    context,
-                )
-            });
-            match refreshed {
-                Ok(CachedHttpResponse::Modified {
-                    response,
-                    validators,
-                }) => response
-                    .bytes()
-                    .map_err(Into::into)
-                    .and_then(|body| {
-                        let entries = geoip.parse_database(&body)?;
-                        let cached = retain_or_write_cached_bytes(
-                            &context.cache_dir,
-                            &geoip.name,
-                            &body,
-                            validators,
-                            context.state.source(&geoip.name),
-                        )?;
-                        context
-                            .state
-                            .mark_success(&geoip.name, Utc::now().to_rfc3339(), cached);
-                        Ok(entries)
-                    })
-                    .inspect(|_| {
+            match fetch_geoip_database(client, geoip, context).await {
+                Ok(CachedBytesResponse::Modified { body, validators }) => {
+                    store_geoip_body(geoip, &body, validators, context).inspect(|_| {
                         successful_sources.push(geoip.name.clone());
                         outcomes.push(SourceRefreshOutcome::Fresh {
                             name: geoip.name.clone(),
                         });
-                    }),
-                Ok(CachedHttpResponse::NotModified {
+                    })
+                }
+                Ok(CachedBytesResponse::NotModified {
                     body,
                     cached_source,
                 }) => geoip.parse_database(&body).inspect(|_| {
@@ -803,6 +837,36 @@ fn add_geoip_with_resilience(
     }
 }
 
+async fn fetch_geoip_database(
+    client: &Client,
+    geoip: &GeoIpConfig,
+    context: &mut RefreshContext,
+) -> Result<CachedBytesResponse, Box<dyn std::error::Error>> {
+    let url = geoip.database_request_url()?;
+    let conditional_enabled = context.policy.enabled;
+    fetch_cached_bytes_response(client, &geoip.name, url, conditional_enabled, context).await
+}
+
+fn store_geoip_body(
+    geoip: &GeoIpConfig,
+    body: &[u8],
+    validators: Option<HttpValidators>,
+    context: &mut RefreshContext,
+) -> Result<GeoIpEntries, Box<dyn std::error::Error>> {
+    let entries = geoip.parse_database(body)?;
+    let cached = retain_or_write_cached_bytes(
+        &context.cache_dir,
+        &geoip.name,
+        body,
+        validators,
+        context.state.source(&geoip.name),
+    )?;
+    context
+        .state
+        .mark_success(&geoip.name, Utc::now().to_rfc3339(), cached);
+    Ok(entries)
+}
+
 fn geoip_refresh_due(
     geoip: &GeoIpConfig,
     context: &RefreshContext,
@@ -883,10 +947,11 @@ fn sha256_file(path: &Path) -> Result<String, std::io::Error> {
     let mut buffer = [0_u8; 64 * 1024];
     loop {
         let read = file.read(&mut buffer)?;
-        if read == 0 {
-            break;
+        match buffer.get(..read) {
+            Some([]) => break,
+            Some(chunk) => hasher.update(chunk),
+            None => return Err(std::io::Error::other("read past end of buffer")),
         }
-        hasher.update(&buffer[..read]);
     }
     Ok(hex::encode(hasher.finalize()))
 }
@@ -1125,16 +1190,17 @@ mod tests {
         cached
     }
 
-    #[test]
-    fn last_modified_validator_is_sent_without_an_etag() {
-        let mut server = Server::new();
+    #[tokio::test]
+    async fn last_modified_validator_is_sent_without_an_etag() {
+        let mut server = Server::new_async().await;
         let url = format!("{}/source.txt", server.url());
         let unchanged = server
             .mock("GET", "/source.txt")
             .match_header("if-none-match", Matcher::Missing)
             .match_header("if-modified-since", "Wed, 21 Oct 2015 07:28:00 GMT")
             .with_status(304)
-            .create();
+            .create_async()
+            .await;
         let validators = HttpValidators {
             resource_key: sha256_hex(url.as_bytes()),
             etag: None,
@@ -1147,22 +1213,24 @@ mod tests {
             Url::parse(&url).unwrap(),
             Some(&validators),
         )
+        .await
         .unwrap();
 
         assert!(matches!(response, HttpResponse::NotModified { .. }));
-        unchanged.assert();
+        unchanged.assert_async().await;
     }
 
-    #[test]
-    fn malformed_stored_validator_is_ignored() {
-        let mut server = Server::new();
+    #[tokio::test]
+    async fn malformed_stored_validator_is_ignored() {
+        let mut server = Server::new_async().await;
         let url = format!("{}/source.txt", server.url());
         let fresh = server
             .mock("GET", "/source.txt")
             .match_header("if-none-match", Matcher::Missing)
             .with_status(200)
             .with_body("192.0.2.0/24\n")
-            .create();
+            .create_async()
+            .await;
         let validators = HttpValidators {
             resource_key: sha256_hex(url.as_bytes()),
             etag: Some("invalid\nvalue".to_string()),
@@ -1175,34 +1243,37 @@ mod tests {
             Url::parse(&url).unwrap(),
             Some(&validators),
         )
+        .await
         .unwrap();
 
         assert!(matches!(response, HttpResponse::Modified { .. }));
-        fresh.assert();
+        fresh.assert_async().await;
     }
 
-    #[test]
-    fn unsolicited_not_modified_response_is_rejected() {
-        let mut server = Server::new();
+    #[tokio::test]
+    async fn unsolicited_not_modified_response_is_rejected() {
+        let mut server = Server::new_async().await;
         let url = format!("{}/source.txt", server.url());
         let unsolicited = server
             .mock("GET", "/source.txt")
             .match_header("if-none-match", Matcher::Missing)
             .match_header("if-modified-since", Matcher::Missing)
             .with_status(304)
-            .create();
+            .create_async()
+            .await;
 
         let error = send_http_request(&Client::new(), "alpha", Url::parse(&url).unwrap(), None)
+            .await
             .err()
             .unwrap();
 
         assert!(error.to_string().contains("without a conditional request"));
-        unsolicited.assert();
+        unsolicited.assert_async().await;
     }
 
-    #[test]
-    fn normal_source_revalidates_with_etag_and_last_modified() {
-        let mut server = Server::new();
+    #[tokio::test]
+    async fn normal_source_revalidates_with_etag_and_last_modified() {
+        let mut server = Server::new_async().await;
         let url = format!("{}/source.txt", server.url());
         let first = server
             .mock("GET", "/source.txt")
@@ -1212,7 +1283,8 @@ mod tests {
             .with_header("etag", "\"v1\"")
             .with_header("last-modified", "Wed, 21 Oct 2015 07:28:00 GMT")
             .with_body("192.0.2.0/24\n")
-            .create();
+            .create_async()
+            .await;
         let directory = tempfile::tempdir().unwrap();
         let mut context = RefreshContext::new(
             ResilienceConfig::default().policy().unwrap(),
@@ -1221,15 +1293,16 @@ mod tests {
         );
         let config = resilient_config(remote_source("alpha", url));
 
-        let initial =
-            retrieve_blocklists_with_resilience(&Client::new(), &config, &mut context).unwrap();
+        let initial = retrieve_blocklists_with_resilience(&Client::new(), &config, &mut context)
+            .await
+            .unwrap();
         assert_eq!(
             initial.source_outcomes,
             vec![SourceRefreshOutcome::Fresh {
                 name: "alpha".to_string()
             }]
         );
-        first.assert();
+        first.assert_async().await;
         first.remove();
 
         let previous_status = context.state.sources.get_mut("alpha").unwrap();
@@ -1242,10 +1315,13 @@ mod tests {
             .match_header("if-modified-since", "Wed, 21 Oct 2015 07:28:00 GMT")
             .with_status(304)
             .with_header("etag", "\"v2\"")
-            .create();
+            .create_async()
+            .await;
 
         let revalidated =
-            retrieve_blocklists_with_resilience(&Client::new(), &config, &mut context).unwrap();
+            retrieve_blocklists_with_resilience(&Client::new(), &config, &mut context)
+                .await
+                .unwrap();
 
         assert_eq!(
             revalidated.source_outcomes,
@@ -1279,12 +1355,12 @@ mod tests {
             validators.last_modified.as_deref(),
             Some("Wed, 21 Oct 2015 07:28:00 GMT")
         );
-        unchanged.assert();
+        unchanged.assert_async().await;
     }
 
-    #[test]
-    fn corrupt_cache_after_304_is_retried_unconditionally() {
-        let mut server = Server::new();
+    #[tokio::test]
+    async fn corrupt_cache_after_304_is_retried_unconditionally() {
+        let mut server = Server::new_async().await;
         let url = format!("{}/source.txt", server.url());
         let directory = tempfile::tempdir().unwrap();
         let cached = cached_with_validators(
@@ -1307,20 +1383,23 @@ mod tests {
             .mock("GET", "/source.txt")
             .match_header("if-none-match", "\"v1\"")
             .with_status(304)
-            .create();
+            .create_async()
+            .await;
         let replacement = server
             .mock("GET", "/source.txt")
             .match_header("if-none-match", Matcher::Missing)
             .with_status(200)
             .with_header("etag", "\"v2\"")
             .with_body("198.51.100.0/24\n")
-            .create();
+            .create_async()
+            .await;
 
         let retrieved = retrieve_blocklists_with_resilience(
             &Client::new(),
             &resilient_config(remote_source("alpha", url)),
             &mut context,
         )
+        .await
         .unwrap();
 
         assert_eq!(
@@ -1337,13 +1416,13 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["198.51.100.0/24".parse().unwrap()]
         );
-        not_modified.assert();
-        replacement.assert();
+        not_modified.assert_async().await;
+        replacement.assert_async().await;
     }
 
-    #[test]
-    fn changed_resource_identity_does_not_send_old_validators() {
-        let mut server = Server::new();
+    #[tokio::test]
+    async fn changed_resource_identity_does_not_send_old_validators() {
+        let mut server = Server::new_async().await;
         let old_url = format!("{}/old.txt", server.url());
         let new_url = format!("{}/new.txt", server.url());
         let directory = tempfile::tempdir().unwrap();
@@ -1367,13 +1446,15 @@ mod tests {
             .match_header("if-none-match", Matcher::Missing)
             .with_status(200)
             .with_body("198.51.100.0/24\n")
-            .create();
+            .create_async()
+            .await;
 
         let retrieved = retrieve_blocklists_with_resilience(
             &Client::new(),
             &resilient_config(remote_source("alpha", new_url)),
             &mut context,
         )
+        .await
         .unwrap();
 
         assert!(matches!(
@@ -1391,12 +1472,12 @@ mod tests {
                 .http_validators
                 .is_none()
         );
-        fresh.assert();
+        fresh.assert_async().await;
     }
 
-    #[test]
-    fn due_geoip_source_uses_conditional_request() {
-        let mut server = Server::new();
+    #[tokio::test]
+    async fn due_geoip_source_uses_conditional_request() {
+        let mut server = Server::new_async().await;
         let url = format!("{}/country.zip", server.url());
         let directory = tempfile::tempdir().unwrap();
         let cached = cached_with_validators(
@@ -1422,7 +1503,8 @@ mod tests {
             .mock("GET", "/country.zip")
             .match_header("if-none-match", "\"geo-v1\"")
             .with_status(304)
-            .create();
+            .create_async()
+            .await;
         let config = Config {
             blocklists: Vec::new(),
             allowlists: Vec::new(),
@@ -1433,8 +1515,9 @@ mod tests {
             resilience: ResilienceConfig::default(),
         };
 
-        let retrieved =
-            retrieve_blocklists_with_resilience(&Client::new(), &config, &mut context).unwrap();
+        let retrieved = retrieve_blocklists_with_resilience(&Client::new(), &config, &mut context)
+            .await
+            .unwrap();
 
         assert_eq!(
             retrieved.source_outcomes,
@@ -1450,12 +1533,12 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec!["192.0.2.0/24".parse().unwrap()]
         );
-        unchanged.assert();
+        unchanged.assert_async().await;
     }
 
-    #[test]
-    fn resilience_disabled_suppresses_geoip_conditionals() {
-        let mut server = Server::new();
+    #[tokio::test]
+    async fn resilience_disabled_suppresses_geoip_conditionals() {
+        let mut server = Server::new_async().await;
         let url = format!("{}/country.zip", server.url());
         let directory = tempfile::tempdir().unwrap();
         let cached = cached_with_validators(
@@ -1486,7 +1569,8 @@ mod tests {
             .match_header("if-none-match", Matcher::Missing)
             .with_status(200)
             .with_body(geoip_zip())
-            .create();
+            .create_async()
+            .await;
         let config = Config {
             blocklists: Vec::new(),
             allowlists: Vec::new(),
@@ -1497,14 +1581,15 @@ mod tests {
             resilience: ResilienceConfig::default(),
         };
 
-        let retrieved =
-            retrieve_blocklists_with_resilience(&Client::new(), &config, &mut context).unwrap();
+        let retrieved = retrieve_blocklists_with_resilience(&Client::new(), &config, &mut context)
+            .await
+            .unwrap();
 
         assert!(matches!(
             retrieved.source_outcomes.as_slice(),
             [SourceRefreshOutcome::Fresh { .. }]
         ));
-        fresh.assert();
+        fresh.assert_async().await;
     }
 
     #[test]
@@ -1542,14 +1627,15 @@ mod tests {
         assert_eq!(retained.http_validators, Some(validators));
     }
 
-    #[test]
-    fn geoip_country_ranges_merge_and_allowlists_remain_exceptions() {
-        let mut server = mockito::Server::new();
+    #[tokio::test]
+    async fn geoip_country_ranges_merge_and_allowlists_remain_exceptions() {
+        let mut server = mockito::Server::new_async().await;
         let response = server
             .mock("GET", "/country.zip")
             .with_status(200)
             .with_body(geoip_zip())
-            .create();
+            .create_async()
+            .await;
         let config = Config {
             blocklists: Vec::new(),
             allowlists: vec![inline_source(
@@ -1576,6 +1662,7 @@ mod tests {
         );
 
         let result = retrieve_blocklists_with_resilience(&Client::new(), &config, &mut context)
+            .await
             .unwrap()
             .blocklists;
 
@@ -1590,11 +1677,11 @@ mod tests {
                 .collect::<Vec<_>>()
                 .is_empty()
         );
-        response.assert();
+        response.assert_async().await;
     }
 
-    #[test]
-    fn geoip_cache_is_reused_without_age_expiry_before_next_attempt() {
+    #[tokio::test]
+    async fn geoip_cache_is_reused_without_age_expiry_before_next_attempt() {
         let config = Config {
             blocklists: Vec::new(),
             allowlists: Vec::new(),
@@ -1624,8 +1711,9 @@ mod tests {
             directory.path().to_path_buf(),
         );
 
-        let retrieved =
-            retrieve_blocklists_with_resilience(&Client::new(), &config, &mut context).unwrap();
+        let retrieved = retrieve_blocklists_with_resilience(&Client::new(), &config, &mut context)
+            .await
+            .unwrap();
         assert_eq!(
             retrieved
                 .blocklists
@@ -1642,10 +1730,14 @@ mod tests {
         );
     }
 
-    #[test]
-    fn uses_a_recent_cached_body_after_fetch_failure() {
-        let mut server = mockito::Server::new();
-        let failed = server.mock("GET", "/source.txt").with_status(500).create();
+    #[tokio::test]
+    async fn uses_a_recent_cached_body_after_fetch_failure() {
+        let mut server = mockito::Server::new_async().await;
+        let failed = server
+            .mock("GET", "/source.txt")
+            .with_status(500)
+            .create_async()
+            .await;
         let directory = tempfile::tempdir().unwrap();
         let mut state = StateFile::default();
         let cached = write_cached_body(directory.path(), "alpha", "192.0.2.0/24\n").unwrap();
@@ -1668,6 +1760,7 @@ mod tests {
             )),
             &mut context,
         )
+        .await
         .unwrap();
 
         assert_eq!(
@@ -1685,13 +1778,17 @@ mod tests {
                 failures: 1,
             }]
         );
-        failed.assert();
+        failed.assert_async().await;
     }
 
-    #[test]
-    fn expires_cache_after_retry_limit() {
-        let mut server = mockito::Server::new();
-        let failed = server.mock("GET", "/source.txt").with_status(500).create();
+    #[tokio::test]
+    async fn expires_cache_after_retry_limit() {
+        let mut server = mockito::Server::new_async().await;
+        let failed = server
+            .mock("GET", "/source.txt")
+            .with_status(500)
+            .create_async()
+            .await;
         let directory = tempfile::tempdir().unwrap();
         let mut state = StateFile::default();
         let cached = write_cached_body(directory.path(), "alpha", "192.0.2.0/24\n").unwrap();
@@ -1715,6 +1812,7 @@ mod tests {
             )),
             &mut context,
         )
+        .await
         .unwrap();
 
         assert!(
@@ -1733,11 +1831,11 @@ mod tests {
             }]
         );
         assert!(!cached_path.exists());
-        failed.assert();
+        failed.assert_async().await;
     }
 
-    #[test]
-    fn expires_cache_after_maximum_age() {
+    #[tokio::test]
+    async fn expires_cache_after_maximum_age() {
         let directory = tempfile::tempdir().unwrap();
         let cached = write_cached_body(directory.path(), "alpha", "192.0.2.0/24\n").unwrap();
         let mut state = StateFile::default();
@@ -1765,8 +1863,12 @@ mod tests {
             state,
             directory.path().to_path_buf(),
         );
-        let mut server = mockito::Server::new();
-        let _failed = server.mock("GET", "/source.txt").with_status(500).create();
+        let mut server = mockito::Server::new_async().await;
+        let _failed = server
+            .mock("GET", "/source.txt")
+            .with_status(500)
+            .create_async()
+            .await;
 
         let retrieved = retrieve_blocklists_with_resilience(
             &Client::new(),
@@ -1776,6 +1878,7 @@ mod tests {
             )),
             &mut context,
         )
+        .await
         .unwrap();
 
         assert!(matches!(
@@ -1785,8 +1888,8 @@ mod tests {
         assert!(!cached_path.exists());
     }
 
-    #[test]
-    fn rejects_corrupted_cached_bodies() {
+    #[tokio::test]
+    async fn rejects_corrupted_cached_bodies() {
         let directory = tempfile::tempdir().unwrap();
         let cached = write_cached_body(directory.path(), "alpha", "192.0.2.0/24\n").unwrap();
         let cached_path = directory.path().join(&cached.cache_file);
@@ -1802,8 +1905,12 @@ mod tests {
             state,
             directory.path().to_path_buf(),
         );
-        let mut server = mockito::Server::new();
-        let _failed = server.mock("GET", "/source.txt").with_status(500).create();
+        let mut server = mockito::Server::new_async().await;
+        let _failed = server
+            .mock("GET", "/source.txt")
+            .with_status(500)
+            .create_async()
+            .await;
 
         let retrieved = retrieve_blocklists_with_resilience(
             &Client::new(),
@@ -1813,6 +1920,7 @@ mod tests {
             )),
             &mut context,
         )
+        .await
         .unwrap();
 
         assert!(matches!(
@@ -1830,8 +1938,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn inline_sources_bypass_the_cache() {
+    #[tokio::test]
+    async fn inline_sources_bypass_the_cache() {
         let directory = tempfile::tempdir().unwrap();
         let cache_dir = directory.path().join("cache");
         let mut context = RefreshContext::new(
@@ -1850,8 +1958,9 @@ mod tests {
             &["192.0.2.0/24"],
         ));
 
-        let retrieved =
-            retrieve_blocklists_with_resilience(&Client::new(), &config, &mut context).unwrap();
+        let retrieved = retrieve_blocklists_with_resilience(&Client::new(), &config, &mut context)
+            .await
+            .unwrap();
 
         assert!(matches!(
             retrieved.source_outcomes.as_slice(),
@@ -1860,8 +1969,8 @@ mod tests {
         assert!(!cache_dir.exists());
     }
 
-    #[test]
-    fn routes_both_direction_sources_and_applies_directional_allowlists() {
+    #[tokio::test]
+    async fn routes_both_direction_sources_and_applies_directional_allowlists() {
         let config = Config {
             blocklists: vec![
                 inline_source(
@@ -1891,6 +2000,7 @@ mod tests {
         };
 
         let blocklists = retrieve_blocklists(&Client::new(), &config)
+            .await
             .unwrap()
             .blocklists;
 
@@ -1907,8 +2017,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn ignores_disabled_sources() {
+    #[tokio::test]
+    async fn ignores_disabled_sources() {
         let mut disabled = inline_source(
             "disabled",
             ListType::Blocklist,
@@ -1927,6 +2037,7 @@ mod tests {
         };
 
         let blocklists = retrieve_blocklists(&Client::new(), &config)
+            .await
             .unwrap()
             .blocklists;
 
@@ -1939,19 +2050,21 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_retrieve_blocklists_fetches_and_merges_mocked_blocklists() {
-        let mut server = Server::new();
+    #[tokio::test]
+    async fn test_retrieve_blocklists_fetches_and_merges_mocked_blocklists() {
+        let mut server = Server::new_async().await;
         let blocklist_one = server
             .mock("GET", "/blocklist-one.txt")
             .with_status(200)
             .with_body("# comment\n8.8.8.0/25\n8.8.8.128/25\n2001:db8::/32\n")
-            .create();
+            .create_async()
+            .await;
         let blocklist_two = server
             .mock("GET", "/blocklist-two.txt")
             .with_status(200)
             .with_body("1.1.1.1\n2001:4860:4860::8888\nnot-an-ip\n")
-            .create();
+            .create_async()
+            .await;
 
         let config = Config {
             blocklists: vec![
@@ -1967,7 +2080,10 @@ mod tests {
         };
         let client = Client::new();
 
-        let result = retrieve_blocklists(&client, &config).unwrap().blocklists;
+        let result = retrieve_blocklists(&client, &config)
+            .await
+            .unwrap()
+            .blocklists;
 
         let expected_v4: Vec<Ipv4Net> =
             vec!["1.1.1.1/32".parse().unwrap(), "8.8.8.0/24".parse().unwrap()];
@@ -1997,12 +2113,12 @@ mod tests {
                 .collect::<Vec<_>>()
                 .is_empty()
         );
-        blocklist_one.assert();
-        blocklist_two.assert();
+        blocklist_one.assert_async().await;
+        blocklist_two.assert_async().await;
     }
 
-    #[test]
-    fn test_retrieve_blocklists_applies_inline_allowlist_source() {
+    #[tokio::test]
+    async fn test_retrieve_blocklists_applies_inline_allowlist_source() {
         let config = Config {
             blocklists: vec![crate::test_support::inline_source(
                 "blocklist",
@@ -2022,7 +2138,10 @@ mod tests {
         };
         let client = Client::new();
 
-        let result = retrieve_blocklists(&client, &config).unwrap().blocklists;
+        let result = retrieve_blocklists(&client, &config)
+            .await
+            .unwrap()
+            .blocklists;
 
         assert_eq!(
             result.inbound.ipv4_networks().collect::<Vec<_>>(),
@@ -2037,8 +2156,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_retrieve_blocklists_skips_disabled_sources() {
+    #[tokio::test]
+    async fn test_retrieve_blocklists_skips_disabled_sources() {
         let mut disabled_source = test_source("http://127.0.0.1/disabled.txt".to_string());
         disabled_source.enabled = false;
 
@@ -2053,7 +2172,10 @@ mod tests {
         };
         let client = Client::new();
 
-        let result = retrieve_blocklists(&client, &config).unwrap().blocklists;
+        let result = retrieve_blocklists(&client, &config)
+            .await
+            .unwrap()
+            .blocklists;
 
         assert!(
             result
@@ -2085,15 +2207,20 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_retrieve_blocklists_continues_after_mocked_fetch_error() {
-        let mut server = Server::new();
-        let failing_blocklist = server.mock("GET", "/failing.txt").with_status(500).create();
+    #[tokio::test]
+    async fn test_retrieve_blocklists_continues_after_mocked_fetch_error() {
+        let mut server = Server::new_async().await;
+        let failing_blocklist = server
+            .mock("GET", "/failing.txt")
+            .with_status(500)
+            .create_async()
+            .await;
         let successful_blocklist = server
             .mock("GET", "/successful.txt")
             .with_status(200)
             .with_body("9.9.9.0/24\n")
-            .create();
+            .create_async()
+            .await;
 
         let config = Config {
             blocklists: vec![
@@ -2109,7 +2236,7 @@ mod tests {
         };
         let client = Client::new();
 
-        let result = retrieve_blocklists(&client, &config).unwrap();
+        let result = retrieve_blocklists(&client, &config).await.unwrap();
 
         assert_eq!(
             result
@@ -2147,18 +2274,19 @@ mod tests {
             result.successful_sources,
             vec![format!("{}/successful.txt", server.url())]
         );
-        failing_blocklist.assert();
-        successful_blocklist.assert();
+        failing_blocklist.assert_async().await;
+        successful_blocklist.assert_async().await;
     }
 
-    #[test]
-    fn test_retrieve_blocklists_applies_inline_private_range_allowlist() {
-        let mut server = Server::new();
+    #[tokio::test]
+    async fn test_retrieve_blocklists_applies_inline_private_range_allowlist() {
+        let mut server = Server::new_async().await;
         let blocklist = server
             .mock("GET", "/zero-dot.txt")
             .with_status(200)
             .with_body("0.0.0.0/8\n0.1.2.3\n8.8.8.0/24\n")
-            .create();
+            .create_async()
+            .await;
 
         let config = Config {
             blocklists: vec![test_source(format!("{}/zero-dot.txt", server.url()))],
@@ -2175,7 +2303,10 @@ mod tests {
         };
         let client = Client::new();
 
-        let result = retrieve_blocklists(&client, &config).unwrap().blocklists;
+        let result = retrieve_blocklists(&client, &config)
+            .await
+            .unwrap()
+            .blocklists;
 
         assert_eq!(
             result.inbound.ipv4_networks().collect::<Vec<_>>(),
@@ -2202,22 +2333,24 @@ mod tests {
                 .collect::<Vec<_>>()
                 .is_empty()
         );
-        blocklist.assert();
+        blocklist.assert_async().await;
     }
 
-    #[test]
-    fn test_retrieve_blocklists_splits_entries_by_direction() {
-        let mut server = Server::new();
+    #[tokio::test]
+    async fn test_retrieve_blocklists_splits_entries_by_direction() {
+        let mut server = Server::new_async().await;
         let inbound_blocklist = server
             .mock("GET", "/inbound.txt")
             .with_status(200)
             .with_body("8.8.8.0/24\n")
-            .create();
+            .create_async()
+            .await;
         let outbound_blocklist = server
             .mock("GET", "/outbound.txt")
             .with_status(200)
             .with_body("9.9.9.0/24\n")
-            .create();
+            .create_async()
+            .await;
 
         let inbound_source = test_source(format!("{}/inbound.txt", server.url()));
         let mut outbound_source = test_source(format!("{}/outbound.txt", server.url()));
@@ -2233,7 +2366,10 @@ mod tests {
         };
         let client = Client::new();
 
-        let result = retrieve_blocklists(&client, &config).unwrap().blocklists;
+        let result = retrieve_blocklists(&client, &config)
+            .await
+            .unwrap()
+            .blocklists;
 
         assert_eq!(
             result.inbound.ipv4_networks().collect::<Vec<_>>(),
@@ -2257,18 +2393,19 @@ mod tests {
                 .collect::<Vec<_>>()
                 .is_empty()
         );
-        inbound_blocklist.assert();
-        outbound_blocklist.assert();
+        inbound_blocklist.assert_async().await;
+        outbound_blocklist.assert_async().await;
     }
 
-    #[test]
-    fn test_retrieve_blocklists_adds_both_direction_to_both_lists() {
-        let mut server = Server::new();
+    #[tokio::test]
+    async fn test_retrieve_blocklists_adds_both_direction_to_both_lists() {
+        let mut server = Server::new_async().await;
         let both_blocklist = server
             .mock("GET", "/both.txt")
             .with_status(200)
             .with_body("4.4.4.0/24\n")
-            .create();
+            .create_async()
+            .await;
 
         let mut both_source = test_source(format!("{}/both.txt", server.url()));
         both_source.direction = Direction::Both;
@@ -2283,7 +2420,10 @@ mod tests {
         };
         let client = Client::new();
 
-        let result = retrieve_blocklists(&client, &config).unwrap().blocklists;
+        let result = retrieve_blocklists(&client, &config)
+            .await
+            .unwrap()
+            .blocklists;
 
         assert_eq!(
             result.inbound.ipv4_networks().collect::<Vec<_>>(),
@@ -2307,27 +2447,30 @@ mod tests {
                 .collect::<Vec<_>>()
                 .is_empty()
         );
-        both_blocklist.assert();
+        both_blocklist.assert_async().await;
     }
 
-    #[test]
-    fn test_retrieve_blocklists_applies_directional_allowlists() {
-        let mut server = Server::new();
+    #[tokio::test]
+    async fn test_retrieve_blocklists_applies_directional_allowlists() {
+        let mut server = Server::new_async().await;
         let inbound_blocklist = server
             .mock("GET", "/inbound-blocklist.txt")
             .with_status(200)
             .with_body("8.8.8.0/24\n")
-            .create();
+            .create_async()
+            .await;
         let outbound_blocklist = server
             .mock("GET", "/outbound-blocklist.txt")
             .with_status(200)
             .with_body("8.8.8.0/24\n")
-            .create();
+            .create_async()
+            .await;
         let inbound_allowlist = server
             .mock("GET", "/inbound-allowlist.txt")
             .with_status(200)
             .with_body("8.8.8.0/25\n")
-            .create();
+            .create_async()
+            .await;
 
         let inbound_blocklist_source =
             test_source(format!("{}/inbound-blocklist.txt", server.url()));
@@ -2346,7 +2489,10 @@ mod tests {
         };
         let client = Client::new();
 
-        let result = retrieve_blocklists(&client, &config).unwrap().blocklists;
+        let result = retrieve_blocklists(&client, &config)
+            .await
+            .unwrap()
+            .blocklists;
 
         assert_eq!(
             result.inbound.ipv4_networks().collect::<Vec<_>>(),
@@ -2356,24 +2502,26 @@ mod tests {
             result.outbound.ipv4_networks().collect::<Vec<_>>(),
             vec!["8.8.8.0/24".parse().unwrap()]
         );
-        inbound_blocklist.assert();
-        outbound_blocklist.assert();
-        inbound_allowlist.assert();
+        inbound_blocklist.assert_async().await;
+        outbound_blocklist.assert_async().await;
+        inbound_allowlist.assert_async().await;
     }
 
-    #[test]
-    fn test_retrieve_blocklists_applies_both_direction_allowlists_to_both_outputs() {
-        let mut server = Server::new();
+    #[tokio::test]
+    async fn test_retrieve_blocklists_applies_both_direction_allowlists_to_both_outputs() {
+        let mut server = Server::new_async().await;
         let blocklist = server
             .mock("GET", "/blocklist.txt")
             .with_status(200)
             .with_body("4.4.4.0/24\n")
-            .create();
+            .create_async()
+            .await;
         let allowlist = server
             .mock("GET", "/allowlist.txt")
             .with_status(200)
             .with_body("4.4.4.0/25\n")
-            .create();
+            .create_async()
+            .await;
 
         let mut blocklist_source = test_source(format!("{}/blocklist.txt", server.url()));
         blocklist_source.direction = Direction::Both;
@@ -2391,7 +2539,10 @@ mod tests {
         };
         let client = Client::new();
 
-        let result = retrieve_blocklists(&client, &config).unwrap().blocklists;
+        let result = retrieve_blocklists(&client, &config)
+            .await
+            .unwrap()
+            .blocklists;
 
         let expected: Vec<Ipv4Net> = vec!["4.4.4.128/25".parse().unwrap()];
         assert_eq!(result.inbound.ipv4_networks().collect::<Vec<_>>(), expected);
@@ -2399,7 +2550,7 @@ mod tests {
             result.outbound.ipv4_networks().collect::<Vec<_>>(),
             expected
         );
-        blocklist.assert();
-        allowlist.assert();
+        blocklist.assert_async().await;
+        allowlist.assert_async().await;
     }
 }

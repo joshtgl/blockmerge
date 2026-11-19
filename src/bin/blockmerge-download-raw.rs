@@ -9,7 +9,7 @@ use blockmerge::{
 };
 use chrono::Utc;
 use clap::Parser;
-use reqwest::blocking::Client;
+use reqwest::Client;
 
 /// Download configured blocklist files for offline testing.
 #[derive(Parser, Debug)]
@@ -55,7 +55,7 @@ fn fixture_filename(source_name: &str) -> String {
     }
 }
 
-fn download_source(
+async fn download_source(
     client: &Client,
     output_dir: &Path,
     name: &str,
@@ -70,13 +70,13 @@ fn download_source(
         };
 
         println!("Downloading '{name}' from {}...", url);
-        let response = client.get(url).send()?;
+        let response = client.get(url).send().await?;
 
         if !response.status().is_success() {
             return Err(format!("{} returned HTTP {}", url, response.status()).into());
         }
 
-        response.bytes()?.to_vec()
+        response.bytes().await?.to_vec()
     };
 
     let file = fixture_filename(name);
@@ -100,12 +100,12 @@ fn geoip_fixture_filename(source_name: &str) -> String {
         + ".zip"
 }
 
-fn download_geoip(
+async fn download_geoip(
     client: &Client,
     output_dir: &Path,
     geoip: &GeoIpConfig,
 ) -> Result<DownloadManifestEntry, Box<dyn std::error::Error>> {
-    let body = geoip.fetch_database(client)?;
+    let body = geoip.fetch_database(client).await?;
     let file = geoip_fixture_filename(&geoip.name);
     fs::write(output_dir.join(&file), &body)?;
     println!("  Wrote {} bytes to {}", body.len(), file);
@@ -143,7 +143,8 @@ fn merge_manifest_entries(
     existing_entries
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
+#[tokio::main(flavor = "current_thread")]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
     let config = load_config(&args.config)?;
     fs::create_dir_all(&args.output_dir)?;
@@ -192,7 +193,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             continue;
         }
 
-        match download_source(&client, &args.output_dir, &source.name, source) {
+        match download_source(&client, &args.output_dir, &source.name, source).await {
             Ok(entry) => entries.push(entry),
             Err(err) => {
                 eprintln!("  Error downloading {}: {err}", source.name);
@@ -210,7 +211,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if !geoip.enabled && !args.include_disabled {
             println!("Skipping disabled source '{}'", geoip.name);
         } else {
-            match download_geoip(&client, &args.output_dir, geoip) {
+            match download_geoip(&client, &args.output_dir, geoip).await {
                 Ok(entry) => entries.push(entry),
                 Err(err) => {
                     eprintln!("  Error downloading {}: {err}", geoip.name);

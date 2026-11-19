@@ -5,7 +5,7 @@ use std::io::{BufRead, BufReader, BufWriter, Read, Write};
 use std::path::{Path, PathBuf};
 
 use chrono::{SecondsFormat, Utc};
-use reqwest::blocking::Client;
+use reqwest::Client;
 
 use crate::config::Config;
 use crate::generation::{
@@ -42,11 +42,11 @@ pub fn format_blocklist_output(blocklist: &IpRanges) -> (String, usize) {
 }
 
 /// Generate rendered inbound and outbound blocklists.
-pub fn generate_blocklist_outputs(
+pub async fn generate_blocklist_outputs(
     client: &Client,
     config: &Config,
 ) -> Result<GeneratedBlocklistOutputs, Box<dyn std::error::Error>> {
-    let retrieved = retrieve_blocklists(client, config)?;
+    let retrieved = retrieve_blocklists(client, config).await?;
     let (inbound_output, inbound_entries) = format_blocklist_output(&retrieved.blocklists.inbound);
     let (outbound_output, outbound_entries) =
         format_blocklist_output(&retrieved.blocklists.outbound);
@@ -61,12 +61,12 @@ pub fn generate_blocklist_outputs(
 }
 
 /// Generate rendered blocklists using fresh and eligible cached source bodies.
-pub fn generate_blocklist_outputs_with_resilience(
+pub async fn generate_blocklist_outputs_with_resilience(
     client: &Client,
     config: &Config,
     context: &mut RefreshContext,
 ) -> Result<GeneratedBlocklistOutputs, Box<dyn std::error::Error>> {
-    let retrieved = retrieve_blocklists_with_resilience(client, config, context)?;
+    let retrieved = retrieve_blocklists_with_resilience(client, config, context).await?;
     let (inbound_output, inbound_entries) = format_blocklist_output(&retrieved.blocklists.inbound);
     let (outbound_output, outbound_entries) =
         format_blocklist_output(&retrieved.blocklists.outbound);
@@ -164,13 +164,13 @@ pub fn write_generated_outputs_if_changed(
 }
 
 /// Generate and atomically write both directional blocklists.
-pub fn generate_and_write_blocklists(
+pub async fn generate_and_write_blocklists(
     client: &Client,
     config: &Config,
     inbound_path: &Path,
     outbound_path: &Path,
 ) -> Result<GeneratedBlocklistOutputs, Box<dyn std::error::Error>> {
-    let outputs = generate_blocklist_outputs(client, config)?;
+    let outputs = generate_blocklist_outputs(client, config).await?;
     write_generated_outputs_if_changed(
         inbound_path,
         outbound_path,
@@ -181,14 +181,14 @@ pub fn generate_and_write_blocklists(
 }
 
 /// Generate and write blocklists using fresh and eligible cached source bodies.
-pub fn generate_and_write_blocklists_with_resilience(
+pub async fn generate_and_write_blocklists_with_resilience(
     client: &Client,
     config: &Config,
     inbound_path: &Path,
     outbound_path: &Path,
     context: &mut RefreshContext,
 ) -> Result<GeneratedBlocklistOutputs, Box<dyn std::error::Error>> {
-    let outputs = generate_blocklist_outputs_with_resilience(client, config, context)?;
+    let outputs = generate_blocklist_outputs_with_resilience(client, config, context).await?;
     write_generated_outputs_if_changed(
         inbound_path,
         outbound_path,
@@ -199,17 +199,17 @@ pub fn generate_and_write_blocklists_with_resilience(
 }
 
 /// Refresh the directional assets served by the web binary.
-pub fn refresh_web_assets(
+pub async fn refresh_web_assets(
     client: &Client,
     config: &Config,
     root_dir: &Path,
 ) -> Result<GeneratedBlocklistOutputs, Box<dyn std::error::Error>> {
     let (inbound_path, outbound_path) = web_asset_output_paths(root_dir);
-    generate_and_write_blocklists(client, config, &inbound_path, &outbound_path)
+    generate_and_write_blocklists(client, config, &inbound_path, &outbound_path).await
 }
 
 /// Refresh web assets using fresh and eligible cached source bodies.
-pub fn refresh_web_assets_with_resilience(
+pub async fn refresh_web_assets_with_resilience(
     client: &Client,
     config: &Config,
     root_dir: &Path,
@@ -223,6 +223,7 @@ pub fn refresh_web_assets_with_resilience(
         &outbound_path,
         context,
     )
+    .await
 }
 
 fn write_atomic_temp(path: &Path, content: &str) -> Result<(), Box<dyn std::error::Error>> {
@@ -282,23 +283,25 @@ fn existing_output_matches(
     }
 
     let mut payload_offset = 0;
-    if !has_timestamp_header
-        && !compare_chunk(
-            &prefix[..prefix_length],
-            payload.as_bytes(),
-            &mut payload_offset,
-        )
-    {
-        return Ok(false);
+    if !has_timestamp_header {
+        let Some(chunk) = prefix.get(..prefix_length) else {
+            return Ok(false);
+        };
+        if !compare_chunk(chunk, payload.as_bytes(), &mut payload_offset) {
+            return Ok(false);
+        }
     }
 
     let mut buffer = [0; COMPARISON_BUFFER_SIZE];
     loop {
         let read = reader.read(&mut buffer)?;
-        if read == 0 {
+        let Some(chunk) = buffer.get(..read) else {
+            return Ok(false);
+        };
+        if chunk.is_empty() {
             return Ok(payload_offset == payload.len());
         }
-        if !compare_chunk(&buffer[..read], payload.as_bytes(), &mut payload_offset) {
+        if !compare_chunk(chunk, payload.as_bytes(), &mut payload_offset) {
             return Ok(false);
         }
     }
@@ -306,8 +309,11 @@ fn existing_output_matches(
 
 fn read_prefix(reader: &mut BufReader<File>, prefix: &mut [u8]) -> std::io::Result<usize> {
     let mut prefix_length = 0;
-    while prefix_length < prefix.len() {
-        let read = reader.read(&mut prefix[prefix_length..])?;
+    while let Some(remaining) = prefix.get_mut(prefix_length..) {
+        if remaining.is_empty() {
+            break;
+        }
+        let read = reader.read(remaining)?;
         if read == 0 {
             break;
         }
@@ -469,8 +475,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn generates_and_writes_directional_inline_sources() {
+    #[tokio::test]
+    async fn generates_and_writes_directional_inline_sources() {
         let config = Config {
             blocklists: vec![
                 inline_source("inbound", Direction::Inbound, &["192.0.2.0/24"]),
@@ -487,8 +493,9 @@ mod tests {
         let inbound = directory.path().join("inbound.txt");
         let outbound = directory.path().join("outbound.txt");
 
-        let outputs =
-            generate_and_write_blocklists(&Client::new(), &config, &inbound, &outbound).unwrap();
+        let outputs = generate_and_write_blocklists(&Client::new(), &config, &inbound, &outbound)
+            .await
+            .unwrap();
 
         assert_eq!(outputs.inbound_entries, 1);
         assert_eq!(outputs.outbound_entries, 1);
@@ -670,8 +677,8 @@ mod tests {
         assert_eq!(outbound, PathBuf::from("/tmp/web-assets/outbound.txt"));
     }
 
-    #[test]
-    fn test_generate_and_write_blocklists_writes_directional_outputs() {
+    #[tokio::test]
+    async fn test_generate_and_write_blocklists_writes_directional_outputs() {
         let config = Config {
             blocklists: vec![
                 crate::test_support::inline_source(
@@ -706,7 +713,9 @@ mod tests {
         let outbound_path = temp_dir.path().join("outbound.txt");
 
         let outputs =
-            generate_and_write_blocklists(&client, &config, &inbound_path, &outbound_path).unwrap();
+            generate_and_write_blocklists(&client, &config, &inbound_path, &outbound_path)
+                .await
+                .unwrap();
 
         assert_eq!(outputs.inbound_entries, 1);
         assert_eq!(outputs.outbound_entries, 1);
@@ -751,8 +760,8 @@ mod tests {
         assert!(!temp_dir.path().join(".inbound.txt.tmp").exists());
     }
 
-    #[test]
-    fn test_refresh_web_assets_smoke_test_with_inline_sources() {
+    #[tokio::test]
+    async fn test_refresh_web_assets_smoke_test_with_inline_sources() {
         let config = Config {
             blocklists: vec![
                 crate::test_support::inline_source("inbound", ListType::Blocklist, vec!["8.8.8.8"]),
@@ -819,7 +828,9 @@ mod tests {
         let client = Client::new();
         let temp_dir = tempdir().unwrap();
 
-        let outputs = refresh_web_assets(&client, &config, temp_dir.path()).unwrap();
+        let outputs = refresh_web_assets(&client, &config, temp_dir.path())
+            .await
+            .unwrap();
 
         assert_eq!(outputs.inbound_entries, 1);
         assert_eq!(outputs.outbound_entries, 1);
